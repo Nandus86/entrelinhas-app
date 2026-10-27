@@ -1947,6 +1947,47 @@
           <div class="leads-kanban" id="leads-kanban">
             <!-- Colunas geradas dinamicamente -->
           </div>
+
+          <!-- ======================================================== -->
+          <!-- LISTA GERAL DE LEADS & CAIXA DE ENTRADA (TRIAGEM)        -->
+          <!-- ======================================================== -->
+          <div class="leads-inbox-section">
+            <div class="panel-header" style="margin-top:28px; margin-bottom:12px; align-items:flex-end;">
+              <div>
+                <h3 style="font-size:1.1rem; font-weight:800; color:var(--brand-blue); display:flex; align-items:center; gap:8px;">
+                  📋 Todos os Contatos & Caixa de Entrada
+                </h3>
+                <span class="panel-subtitle">Lista de todos os contatos recebidos. Veja quem acabou de chegar e decida quem entra no Kanban.</span>
+              </div>
+              <div class="leads-inbox-badges">
+                <span class="leads-inbox-badge inbox-pending" id="badge-leads-inbox-count">0 na caixa de entrada</span>
+                <span class="leads-inbox-badge inbox-kanban" id="badge-leads-kanban-count">0 no funil</span>
+              </div>
+            </div>
+
+            <div class="admin-table-container">
+              <div class="table-responsive">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Data</th>
+                      <th>Origem</th>
+                      <th>Interessado</th>
+                      <th>WhatsApp / Contato</th>
+                      <th>Curso / Objetivo</th>
+                      <th>Mensagem</th>
+                      <th>Presença no Kanban</th>
+                      <th>Etapa</th>
+                      <th>Ações</th>
+                    </tr>
+                  </thead>
+                  <tbody id="admin-leads-table-tbody">
+                    <tr><td colspan="9" class="text-center text-muted">Carregando contatos...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
         </section>
 
       </main>
@@ -2353,6 +2394,13 @@
           <div class="form-group">
             <label for="lead-notes">Anotações internas</label>
             <textarea id="lead-notes" rows="2" placeholder="Histórico de contato, retorno combinado..."></textarea>
+          </div>
+          <div class="form-group" style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px 12px;">
+            <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin:0;">
+              <input type="checkbox" id="lead-in-kanban" checked style="width:18px; height:18px; accent-color:var(--brand-blue);">
+              <span style="font-weight:700; color:var(--text-main);">📌 Exibir este lead no Funil Kanban</span>
+            </label>
+            <small class="text-xs text-muted" style="display:block; margin-top:4px;">Se desmarcado, ele fica apenas guardado na Lista Geral / Caixa de Entrada abaixo do quadro.</small>
           </div>
           <div class="sheet-actions">
             <button type="button" class="btn-cancel" id="btn-delete-lead" style="color:#dc2626;">Excluir</button>

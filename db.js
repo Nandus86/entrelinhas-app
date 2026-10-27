@@ -439,6 +439,7 @@ async function initDB(seedDataFn) {
         -- Dados complementares do aluno (endereço, nascimento, colégio)
         ALTER TABLE leads_contacts ADD COLUMN IF NOT EXISTS source VARCHAR(30) DEFAULT 'site';
         ALTER TABLE leads_contacts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+        ALTER TABLE leads_contacts ADD COLUMN IF NOT EXISTS in_kanban BOOLEAN DEFAULT false;
         ALTER TABLE students ADD COLUMN IF NOT EXISTS address TEXT;
         ALTER TABLE students ADD COLUMN IF NOT EXISTS birth_date DATE;
         ALTER TABLE students ADD COLUMN IF NOT EXISTS school_name VARCHAR(150);

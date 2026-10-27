@@ -7065,24 +7065,25 @@ async function loadAdminLeads() {
 
   try {
     kanban.innerHTML = '<div style="grid-column:1/-1; text-align:center; padding:30px;" class="text-muted">Carregando funil de interessados...</div>';
+    const tbody = document.getElementById('admin-leads-table-tbody');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">Carregando contatos...</td></tr>';
+
     const res = await fetch(`${API_BASE}/api/leads`, { headers: getAuthHeaders() });
     if (!res.ok) throw new Error('Falha ao carregar leads');
     state.adminLeads = await res.json();
     renderLeadsKanban();
+    renderLeadsTable();
   } catch (err) {
     kanban.innerHTML = `<div style="grid-column:1/-1; text-align:center; padding:30px; color:var(--danger);">${escapeHtmlDoc(err.message)}</div>`;
   }
 }
 
-function renderLeadsKanban() {
-  const kanban = document.getElementById('leads-kanban');
-  if (!kanban) return;
-
+function getFilteredLeads() {
   const leads = state.adminLeads || [];
   const search = (leadSearchQuery || '').toLowerCase().trim();
   const source = leadSourceFilter || '';
 
-  const filtered = leads.filter(l => {
+  return leads.filter(l => {
     if (source && (l.source || 'site') !== source) return false;
     if (search) {
       const matchName = (l.name || '').toLowerCase().includes(search);
@@ -7096,9 +7097,18 @@ function renderLeadsKanban() {
     }
     return true;
   });
+}
+
+function renderLeadsKanban() {
+  const kanban = document.getElementById('leads-kanban');
+  if (!kanban) return;
+
+  const filtered = getFilteredLeads();
+  // No Kanban entram apenas os leads marcados com in_kanban === true
+  const kanbanLeads = filtered.filter(l => Boolean(l.in_kanban));
 
   const columnsHtml = LEAD_COLUMNS.map((col, colIdx) => {
-    const colLeads = filtered.filter(l => (l.status || 'novo') === col.id);
+    const colLeads = kanbanLeads.filter(l => (l.status || 'novo') === col.id);
     const prevCol = colIdx > 0 ? LEAD_COLUMNS[colIdx - 1] : null;
     const nextCol = colIdx < LEAD_COLUMNS.length - 1 ? LEAD_COLUMNS[colIdx + 1] : null;
 
@@ -7115,7 +7125,10 @@ function renderLeadsKanban() {
         <div class="lead-card" draggable="true" data-id="${l.id}">
           <div class="lead-card-header">
             <span class="lead-source-tag">${srcInfo.icon} ${srcInfo.label}</span>
-            ${dateStr ? `<span class="lead-date-tag">${dateStr}</span>` : ''}
+            <div style="display:flex; align-items:center; gap:6px;">
+              ${dateStr ? `<span class="lead-date-tag">${dateStr}</span>` : ''}
+              <button type="button" class="btn-lead-unkanban" data-id="${l.id}" title="Tirar do Kanban e manter na lista geral">✕</button>
+            </div>
           </div>
           <div class="lead-card-title" title="Clique para editar">${escapeHtmlDoc(l.name)}</div>
           ${l.course_interest ? `<div class="lead-card-course">📚 <strong>${escapeHtmlDoc(l.course_interest)}</strong>${l.student_grade ? ' • ' + escapeHtmlDoc(l.student_grade) : ''}</div>` : ''}
@@ -7155,7 +7168,7 @@ function renderLeadsKanban() {
           <span class="kanban-col-count">${colLeads.length}</span>
         </div>
         <div class="kanban-col-body" data-status="${col.id}">
-          ${cardsHtml.length > 0 ? cardsHtml : '<div class="kanban-empty-drop text-muted text-xs">Arraste um lead para cá</div>'}
+          ${cardsHtml.length > 0 ? cardsHtml : '<div class="kanban-empty-drop text-muted text-xs">Nenhum lead nesta etapa</div>'}
         </div>
       </div>
     `;
@@ -7163,6 +7176,152 @@ function renderLeadsKanban() {
 
   kanban.innerHTML = columnsHtml;
   bindKanbanInteractions();
+}
+
+function renderLeadsTable() {
+  const tbody = document.getElementById('admin-leads-table-tbody');
+  if (!tbody) return;
+
+  const allLeads = state.adminLeads || [];
+  const inboxCount = allLeads.filter(l => !l.in_kanban).length;
+  const inKanbanCount = allLeads.filter(l => Boolean(l.in_kanban)).length;
+
+  const badgeInbox = document.getElementById('badge-leads-inbox-count');
+  const badgeKanban = document.getElementById('badge-leads-kanban-count');
+  if (badgeInbox) badgeInbox.textContent = `📥 ${inboxCount} na caixa de entrada`;
+  if (badgeKanban) badgeKanban.textContent = `📌 ${inKanbanCount} no Kanban`;
+
+  const filtered = getFilteredLeads();
+
+  if (filtered.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted py-4">Nenhum contato encontrado com os filtros atuais.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = filtered.map(l => {
+    const srcInfo = LEAD_SOURCE_INFO[l.source] || LEAD_SOURCE_INFO['site'];
+    const cleanPhone = (l.phone || '').replace(/\D/g, '');
+    const waLink = cleanPhone
+      ? `https://wa.me/55${cleanPhone}?text=${encodeURIComponent(`Olá ${l.name}, tudo bem? Aqui é da Escola Entrelinhas sobre seu interesse em ${l.course_interest || 'nossos cursos'}!`)}`
+      : null;
+
+    const dt = l.created_at ? new Date(l.created_at) : null;
+    const dateFormatted = dt ? `${dt.toLocaleDateString('pt-BR')} <small class="text-muted">${dt.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</small>` : '-';
+
+    const isInKanban = Boolean(l.in_kanban);
+
+    return `
+      <tr class="${!isInKanban ? 'row-inbox-lead' : ''}">
+        <td style="white-space:nowrap;">${dateFormatted}</td>
+        <td>
+          <span class="lead-source-tag">${srcInfo.icon} ${srcInfo.label}</span>
+        </td>
+        <td>
+          <strong>${escapeHtmlDoc(l.name)}</strong>
+          ${l.email ? `<small class="text-muted" style="display:block;">${escapeHtmlDoc(l.email)}</small>` : ''}
+        </td>
+        <td>
+          ${waLink ? `
+            <a href="${waLink}" target="_blank" rel="noopener" class="lead-wa-btn">
+              📱 ${escapeHtmlDoc(l.phone)}
+            </a>
+          ` : `<span class="text-xs text-muted">📞 ${escapeHtmlDoc(l.phone || 'N/I')}</span>`}
+        </td>
+        <td>
+          <strong>${escapeHtmlDoc(l.course_interest || 'Geral')}</strong>
+          ${l.student_grade ? `<small class="text-muted" style="display:block;">${escapeHtmlDoc(l.student_grade)}</small>` : ''}
+        </td>
+        <td style="max-width:220px; font-size:0.8rem; color:#475569;">
+          ${escapeHtmlDoc(l.message || l.notes || 'Sem observações')}
+        </td>
+        <td>
+          ${isInKanban ? `
+            <div style="display:inline-flex; align-items:center; gap:6px;">
+              <span class="badge-kanban-status active" title="Este contato está visível no Funil Kanban">📌 No Kanban</span>
+              <button type="button" class="btn-toggle-kanban remove" data-id="${l.id}" data-action="remove" title="Tirar do Kanban (mantém na lista geral)">Tirar</button>
+            </div>
+          ` : `
+            <div style="display:inline-flex; align-items:center; gap:6px;">
+              <span class="badge-kanban-status inbox" title="Aguardando triagem">📥 Caixa Entrada</span>
+              <button type="button" class="btn-toggle-kanban add" data-id="${l.id}" data-action="add" title="Colocar este contato no Funil Kanban">➕ Pôr no Kanban</button>
+            </div>
+          `}
+        </td>
+        <td>
+          <select class="select-lead-status-table" data-id="${l.id}" style="padding:4px 8px; border-radius:6px; border:1px solid #cbd5e1; font-size:0.8rem; font-weight:700;">
+            <option value="novo" ${l.status === 'novo' ? 'selected' : ''}>🟡 Novo</option>
+            <option value="contatado" ${l.status === 'contatado' ? 'selected' : ''}>💬 Em Atendimento</option>
+            <option value="agendado" ${l.status === 'agendado' ? 'selected' : ''}>📅 Aula Experimental</option>
+            <option value="matriculado" ${l.status === 'matriculado' ? 'selected' : ''}>🎉 Matriculado</option>
+            <option value="arquivado" ${l.status === 'arquivado' ? 'selected' : ''}>⚪ Arquivado</option>
+          </select>
+        </td>
+        <td style="white-space:nowrap;">
+          <button type="button" class="btn-sm-action btn-edit-lead-table" data-id="${l.id}" style="background:#eff6ff; color:var(--brand-blue); border:none; padding:4px 8px; border-radius:6px; font-weight:700; cursor:pointer;" title="Editar Lead">
+            ✏️
+          </button>
+          <button type="button" class="btn-sm-action btn-del-lead-table" data-id="${l.id}" style="background:#fee2e2; color:#dc2626; border:none; padding:4px 8px; border-radius:6px; font-weight:700; cursor:pointer; margin-left:4px;" title="Excluir">
+            🗑️
+          </button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+
+  bindTableInteractions();
+}
+
+function bindTableInteractions() {
+  const tbody = document.getElementById('admin-leads-table-tbody');
+  if (!tbody) return;
+
+  // Botões de colocar / tirar do Kanban
+  tbody.querySelectorAll('.btn-toggle-kanban').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.id;
+      const shouldAdd = btn.dataset.action === 'add';
+      toggleLeadKanban(id, shouldAdd);
+    });
+  });
+
+  // Select de status na tabela
+  tbody.querySelectorAll('.select-lead-status-table').forEach(sel => {
+    sel.addEventListener('change', () => {
+      updateLeadStatus(sel.dataset.id, sel.value);
+    });
+  });
+
+  // Botão de editar
+  tbody.querySelectorAll('.btn-edit-lead-table').forEach(btn => {
+    btn.addEventListener('click', () => openLeadModal(btn.dataset.id));
+  });
+
+  // Botão de excluir
+  tbody.querySelectorAll('.btn-del-lead-table').forEach(btn => {
+    btn.addEventListener('click', () => deleteLead(btn.dataset.id));
+  });
+}
+
+async function toggleLeadKanban(leadId, addToKanban) {
+  try {
+    const res = await fetch(`${API_BASE}/api/leads/${leadId}`, {
+      method: 'PATCH',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ in_kanban: addToKanban })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Falha ao alterar presença no Kanban');
+
+    const item = (state.adminLeads || []).find(l => String(l.id) === String(leadId));
+    if (item) item.in_kanban = addToKanban;
+
+    renderLeadsKanban();
+    renderLeadsTable();
+
+    showToast(addToKanban ? ' Lead adicionado ao Kanban!' : ' Lead retirado do Kanban (mantido na lista).');
+  } catch (err) {
+    showAppAlert(err.message, 'Funil Kanban');
+  }
 }
 
 function bindKanbanInteractions() {
@@ -7204,6 +7363,14 @@ function bindKanbanInteractions() {
       if (current && current.status === targetStatus) return;
 
       await updateLeadStatus(leadId, targetStatus);
+    });
+  });
+
+  // Botão ✕ para tirar do Kanban diretamente do card
+  kanban.querySelectorAll('.btn-lead-unkanban').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleLeadKanban(btn.dataset.id, false);
     });
   });
 
@@ -7251,6 +7418,8 @@ function openLeadModal(leadId = null) {
 
   form.reset();
 
+  const inKanbanChk = document.getElementById('lead-in-kanban');
+
   if (leadId) {
     const lead = (state.adminLeads || []).find(l => String(l.id) === String(leadId));
     if (!lead) return;
@@ -7266,12 +7435,14 @@ function openLeadModal(leadId = null) {
     document.getElementById('lead-status').value = lead.status || 'novo';
     document.getElementById('lead-message').value = lead.message || '';
     document.getElementById('lead-notes').value = lead.notes || '';
+    if (inKanbanChk) inKanbanChk.checked = Boolean(lead.in_kanban);
     if (delBtn) delBtn.classList.remove('hidden');
   } else {
     title.textContent = 'Novo Lead (Cadastro Manual)';
     document.getElementById('lead-edit-id').value = '';
     document.getElementById('lead-source').value = 'whatsapp';
     document.getElementById('lead-status').value = 'novo';
+    if (inKanbanChk) inKanbanChk.checked = true;
     if (delBtn) delBtn.classList.add('hidden');
   }
 
@@ -7297,6 +7468,7 @@ async function updateLeadStatus(leadId, newStatus) {
     const item = (state.adminLeads || []).find(l => String(l.id) === String(leadId));
     if (item) item.status = newStatus;
     renderLeadsKanban();
+    renderLeadsTable();
     showToast('Etapa do lead atualizada!');
   } catch (err) {
     showAppAlert(err.message, 'Atualizar Lead');
@@ -7343,6 +7515,7 @@ function setupLeadsEvents() {
     searchInput.addEventListener('input', (e) => {
       leadSearchQuery = e.target.value;
       renderLeadsKanban();
+      renderLeadsTable();
     });
   }
 
@@ -7351,6 +7524,7 @@ function setupLeadsEvents() {
     sourceFilter.addEventListener('change', (e) => {
       leadSourceFilter = e.target.value;
       renderLeadsKanban();
+      renderLeadsTable();
     });
   }
 
@@ -7359,6 +7533,7 @@ function setupLeadsEvents() {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const editId = document.getElementById('lead-edit-id').value;
+      const inKanbanChk = document.getElementById('lead-in-kanban');
       const payload = {
         name: document.getElementById('lead-name').value.trim(),
         phone: document.getElementById('lead-phone').value.trim(),
@@ -7368,7 +7543,8 @@ function setupLeadsEvents() {
         source: document.getElementById('lead-source').value,
         status: document.getElementById('lead-status').value,
         message: document.getElementById('lead-message').value.trim() || null,
-        notes: document.getElementById('lead-notes').value.trim() || null
+        notes: document.getElementById('lead-notes').value.trim() || null,
+        in_kanban: inKanbanChk ? inKanbanChk.checked : true
       };
 
       const url = editId ? `${API_BASE}/api/leads/${editId}` : `${API_BASE}/api/leads/manual`;
@@ -7413,6 +7589,8 @@ window.openNewInvoiceModal = openNewInvoiceModal;
 window.closeNewInvoiceModal = closeNewInvoiceModal;
 window.updateLeadStatus = updateLeadStatus;
 window.deleteLead = deleteLead;
+window.toggleLeadKanban = toggleLeadKanban;
+window.openLeadModal = openLeadModal;
 
 // =========================================================================
 // 📋 RELATÓRIO DE ACOMPANHAMENTO PEDAGÓGICO (mesmas seções da ficha impressa)

@@ -3438,8 +3438,8 @@ app.post('/api/leads', async (req, res) => {
     }
 
     const result = await pool.query(`
-      INSERT INTO leads_contacts (name, phone, email, course_interest, student_grade, message, status)
-      VALUES ($1, $2, $3, $4, $5, $6, 'novo')
+      INSERT INTO leads_contacts (name, phone, email, course_interest, student_grade, message, status, in_kanban, source)
+      VALUES ($1, $2, $3, $4, $5, $6, 'novo', false, 'site')
       RETURNING *
     `, [
       name.trim(),
@@ -3480,18 +3480,18 @@ const LEAD_SOURCES = ['site', 'whatsapp', 'instagram', 'facebook', 'indicacao', 
 
 app.post('/api/leads/manual', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, phone, email, course_interest, student_grade, message, notes, status = 'novo', source = 'outro' } = req.body;
+    const { name, phone, email, course_interest, student_grade, message, notes, status = 'novo', source = 'outro', in_kanban = true } = req.body;
     if (!name || !name.trim() || !phone || !phone.trim()) {
       return res.status(400).json({ error: 'Nome e telefone são obrigatórios.' });
     }
     if (!LEAD_STATUSES.includes(status)) return res.status(400).json({ error: 'Etapa inválida.' });
     if (!LEAD_SOURCES.includes(source)) return res.status(400).json({ error: 'Origem inválida.' });
     const result = await pool.query(`
-      INSERT INTO leads_contacts (name, phone, email, course_interest, student_grade, message, notes, status, source)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      INSERT INTO leads_contacts (name, phone, email, course_interest, student_grade, message, notes, status, source, in_kanban)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       RETURNING *
     `, [name.trim(), phone.trim(), (email || '').trim() || null, (course_interest || '').trim() || null,
-        (student_grade || '').trim() || null, (message || '').trim() || null, (notes || '').trim() || null, status, source]);
+        (student_grade || '').trim() || null, (message || '').trim() || null, (notes || '').trim() || null, status, source, Boolean(in_kanban)]);
     res.status(201).json({ message: 'Lead cadastrado!', lead: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3520,6 +3520,10 @@ app.patch('/api/leads/:id', authenticateToken, requireAdmin, async (req, res) =>
         params.push(body[f] === null ? null : (String(body[f]).trim() || null));
         sets.push(`${f} = $${params.length}`);
       }
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'in_kanban')) {
+      params.push(Boolean(body.in_kanban));
+      sets.push(`in_kanban = $${params.length}`);
     }
     if (sets.length === 0) return res.status(400).json({ error: 'Nada para atualizar.' });
     sets.push('updated_at = CURRENT_TIMESTAMP');
