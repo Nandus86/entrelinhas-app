@@ -2523,8 +2523,6 @@ function setupEventListeners() {
   const tabLoginParent = document.getElementById('tab-login-parent');
   const formLogin = document.getElementById('form-login');
   const formParentLogin = document.getElementById('form-parent-login');
-  const quickSchoolSec = document.getElementById('quick-school-section');
-  const quickParentSec = document.getElementById('quick-parent-section');
 
   if (tabLoginSchool && tabLoginParent) {
     tabLoginSchool.addEventListener('click', () => {
@@ -2532,8 +2530,6 @@ function setupEventListeners() {
       tabLoginParent.classList.remove('active');
       formLogin.classList.remove('hidden');
       formParentLogin.classList.add('hidden');
-      quickSchoolSec.classList.remove('hidden');
-      quickParentSec.classList.add('hidden');
     });
 
     tabLoginParent.addEventListener('click', () => {
@@ -2541,8 +2537,6 @@ function setupEventListeners() {
       tabLoginSchool.classList.remove('active');
       formParentLogin.classList.remove('hidden');
       formLogin.classList.add('hidden');
-      quickParentSec.classList.remove('hidden');
-      quickSchoolSec.classList.add('hidden');
     });
   }
 
@@ -2564,26 +2558,6 @@ function setupEventListeners() {
     });
   }
 
-  // Acesso rápido de teste (Equipe Escolar)
-  document.querySelectorAll('#quick-school-section .quick-user-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const email = btn.getAttribute('data-email');
-      const pass = btn.getAttribute('data-pass');
-      document.getElementById('login-email').value = email;
-      document.getElementById('login-password').value = pass;
-      handleLogin(email, pass);
-    });
-  });
-
-  // Acesso rápido para Demonstração (Pais)
-  document.querySelectorAll('[data-parent-code]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const code = btn.getAttribute('data-parent-code');
-      const input = document.getElementById('parent-access-code');
-      if (input) input.value = code;
-      handleParentLogin(code);
-    });
-  });
 
   // Navegação no Portal dos Pais (Desktop e Mobile)
   document.querySelectorAll('[data-parent-subtab]').forEach(btn => {
