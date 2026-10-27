@@ -224,6 +224,7 @@ function formatLogDateTime(log) {
 document.addEventListener('DOMContentLoaded', () => {
   setupNavigation();
   setupEventListeners();
+  setupLeadsEvents();
   setupPortalManagementUI();
   setupFamilyMessaging();
   setupFamilyAlerts();
@@ -715,6 +716,47 @@ async function loadStats() {
     document.getElementById('stat-total-logs').textContent = stats.total_logs || 0;
     document.getElementById('stat-total-presences').textContent = stats.total_presences || 0;
     document.getElementById('stat-total-absences').textContent = stats.total_absences || 0;
+
+    // Renderização dos Aniversariantes do Mês
+    const monthNames = [
+      'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
+      'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'
+    ];
+    const now = new Date();
+    const currentMonthName = monthNames[now.getMonth()];
+    const monthLabelEl = document.getElementById('birthdays-month-label');
+    const countEl = document.getElementById('birthdays-count');
+    const listEl = document.getElementById('birthdays-list');
+
+    if (monthLabelEl) monthLabelEl.textContent = currentMonthName;
+    if (listEl) {
+      const bdays = Array.isArray(stats.birthdays) ? stats.birthdays : [];
+      if (countEl) countEl.textContent = `${bdays.length} aniversariante(s)`;
+
+      if (bdays.length === 0) {
+        listEl.innerHTML = '<p class="text-xs text-muted" style="text-align:center; padding:14px 0;">Nenhum aluno aniversariante registrado neste mês.</p>';
+      } else {
+        const todayDay = now.getDate();
+        listEl.innerHTML = bdays.map(b => {
+          const isToday = parseInt(b.birth_day) === todayDay;
+          return `
+            <div class="birthday-item ${isToday ? 'birthday-today' : ''}">
+              <div class="birthday-badge">
+                <span class="birthday-day">${String(b.birth_day).padStart(2, '0')}</span>
+                <span class="birthday-month-sub">${currentMonthName.substring(0, 3).toLowerCase()}</span>
+              </div>
+              <div class="birthday-info">
+                <strong>${escapeHtmlDoc(b.name)}</strong>
+                <span class="text-xs ${isToday ? 'birthday-highlight' : 'text-muted'}">
+                  ${isToday ? '🎉 <strong>Hoje é o aniversário!</strong>' : `Aniversário dia ${b.birth_day}`}
+                  ${b.school_name ? ' • 🏫 ' + escapeHtmlDoc(b.school_name) : ''}
+                </span>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
+    }
   } catch (err) {
     console.error(err);
   }
@@ -1392,6 +1434,7 @@ function openTeacherModal(teacherId = null) {
     document.getElementById('teacher-email').value = teacher.email;
     document.getElementById('teacher-role').value = teacher.role;
     document.getElementById('teacher-status').value = teacher.status;
+    document.getElementById('teacher-phone').value = teacher.phone || '';
     document.getElementById('teacher-password').placeholder = 'Deixe em branco para não alterar';
     document.getElementById('hint-teacher-password').textContent = 'Preencha apenas se desejar redefinir a senha do professor.';
 
@@ -1406,7 +1449,139 @@ function openTeacherModal(teacherId = null) {
     document.getElementById('hint-teacher-password').textContent = 'Senha obrigatória para novo professor.';
   }
 
+  // Documentos: disponíveis só depois que o professor existe
+  const docsGroup = document.getElementById('group-teacher-documents');
+  docsGroup.classList.toggle('hidden', !teacherId);
+  document.getElementById('teacher-documents-list').innerHTML = '';
+  if (teacherId) loadTeacherDocuments(teacherId);
+
   modal.classList.remove('hidden');
+}
+
+const TEACHER_DOC_LABELS = {
+  curriculo: '📄 Currículo',
+  documento_pessoal: '🪪 Documento pessoal',
+  contrato: '📝 Contrato',
+  certificado: '🎓 Certificado',
+  outro: '📎 Outro'
+};
+
+function formatFileSize(bytes) {
+  if (!bytes) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function escapeHtmlDoc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function loadTeacherDocuments(teacherId) {
+  const list = document.getElementById('teacher-documents-list');
+  list.innerHTML = '<p class="text-xs text-muted">Carregando documentos...</p>';
+  try {
+    const res = await fetch(`${API_BASE}/api/teachers/${teacherId}/documents`, { headers: getAuthHeaders() });
+    const docs = await res.json();
+    if (!res.ok) throw new Error(docs.error || 'Erro ao carregar documentos');
+    if (docs.length === 0) {
+      list.innerHTML = '<p class="text-xs text-muted">Nenhum documento anexado.</p>';
+      return;
+    }
+    list.innerHTML = docs.map(d => `
+      <div class="teacher-doc-item">
+        <div class="teacher-doc-info">
+          <strong>${escapeHtmlDoc(d.file_name)}</strong>
+          <span class="text-xs text-muted">${TEACHER_DOC_LABELS[d.category] || d.category}${d.description ? ' • ' + escapeHtmlDoc(d.description) : ''} • ${formatFileSize(d.size_bytes)} • ${new Date(d.created_at).toLocaleDateString('pt-BR')}</span>
+        </div>
+        <div class="teacher-doc-actions">
+          <button type="button" class="btn-action-pill btn-doc-download" data-id="${d.id}" data-name="${escapeHtmlDoc(d.file_name)}" title="Baixar">⬇️</button>
+          <button type="button" class="btn-action-pill danger btn-doc-delete" data-id="${d.id}" title="Excluir">🗑️</button>
+        </div>
+      </div>
+    `).join('');
+
+    list.querySelectorAll('.btn-doc-download').forEach(b => b.addEventListener('click', () => downloadTeacherDocument(b.dataset.id, b.dataset.name)));
+    list.querySelectorAll('.btn-doc-delete').forEach(b => b.addEventListener('click', () => {
+      showAppConfirm('Excluir este documento? Esta ação não pode ser desfeita.', async () => {
+        try {
+          const r = await fetch(`${API_BASE}/api/teacher-documents/${b.dataset.id}`, { method: 'DELETE', headers: getAuthHeaders() });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.error || 'Erro ao excluir');
+          showToast('Documento removido.');
+          loadTeacherDocuments(teacherId);
+          loadTeachers();
+        } catch (err) {
+          showAppAlert(err.message, 'Documentos');
+        }
+      }, 'Excluir Documento', true);
+    }));
+  } catch (err) {
+    list.innerHTML = `<p style="color:var(--danger);" class="text-xs">${escapeHtmlDoc(err.message)}</p>`;
+  }
+}
+
+async function downloadTeacherDocument(docId, fileName) {
+  try {
+    const res = await fetch(`${API_BASE}/api/teacher-documents/${docId}/download`, { headers: getAuthHeaders() });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.error || 'Erro ao baixar documento');
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName || 'documento';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    showAppAlert(err.message, 'Documentos');
+  }
+}
+
+async function uploadTeacherDocument() {
+  const teacherId = document.getElementById('teacher-edit-id').value;
+  const fileInput = document.getElementById('teacher-doc-file');
+  const file = fileInput.files && fileInput.files[0];
+  if (!teacherId) return;
+  if (!file) return showAppAlert('Escolha um arquivo para anexar.', 'Documentos');
+  if (file.size > 10 * 1024 * 1024) return showAppAlert('O arquivo passa do limite de 10 MB.', 'Documentos');
+
+  const btn = document.getElementById('btn-upload-teacher-doc');
+  btn.disabled = true;
+  try {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('Não foi possível ler o arquivo.'));
+      reader.readAsDataURL(file);
+    });
+    const res = await fetch(`${API_BASE}/api/teachers/${teacherId}/documents`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        file_name: file.name,
+        mime_type: file.type,
+        data_base64: dataUrl,
+        category: document.getElementById('teacher-doc-category').value,
+        description: document.getElementById('teacher-doc-description').value
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Erro ao anexar documento');
+    showToast('Documento anexado!');
+    fileInput.value = '';
+    document.getElementById('teacher-doc-description').value = '';
+    loadTeacherDocuments(teacherId);
+    loadTeachers();
+  } catch (err) {
+    showAppAlert(err.message, 'Documentos');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function handleDeleteTeacher(teacherId) {
@@ -1459,7 +1634,8 @@ async function loadAdminStudents() {
           <div class="teacher-card-header">
             <div style="flex:1; min-width:0;">
               <h4 style="font-size:1rem; font-weight:800; color:var(--brand-blue); margin:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${st.name}">${st.name}</h4>
-              <span class="text-xs text-muted" style="display:block; margin-top:2px;">${st.objective_grade || 'Objetivo não informado'}</span>
+              <span class="text-xs text-muted" style="display:block; margin-top:2px;">${st.objective_grade || 'Objetivo não informado'}${st.school_name ? ' • 🏫 ' + st.school_name : ''}</span>
+              ${st.birthday_br ? `<span class="text-xs ${isBirthdayMonth(st.birth_date) ? 'birthday-highlight' : 'text-muted'}" style="display:block; margin-top:2px;">🎂 ${st.birthday_br}${isBirthdayMonth(st.birth_date) ? ' — aniversariante do mês!' : ''}</span>` : ''}
             </div>
             <span class="status-badge ${st.status || 'ativo'}">${st.status || 'ativo'}</span>
           </div>
@@ -1495,6 +1671,9 @@ async function loadAdminStudents() {
               <button class="btn-action-pill btn-edit-student-admin" data-id="${st.id}" title="Editar dados do aluno">
                 <span>✏️</span> Editar
               </button>
+              <button class="btn-action-pill btn-toggle-status-student-admin" data-id="${st.id}" data-status="${st.status || 'ativo'}" title="${(st.status || 'ativo') === 'ativo' ? 'Inativar aluno (sai da grade, mantém o histórico)' : 'Reativar aluno'}">
+                <span>${(st.status || 'ativo') === 'ativo' ? '⏸️' : '▶️'}</span> ${(st.status || 'ativo') === 'ativo' ? 'Inativar' : 'Reativar'}
+              </button>
               <button class="btn-action-pill danger btn-delete-student-admin" data-id="${st.id}" title="Remover aluno">
                 <span>🗑️</span> Excluir
               </button>
@@ -1529,9 +1708,43 @@ async function loadAdminStudents() {
     container.querySelectorAll('.btn-delete-student-admin').forEach(b => {
       b.addEventListener('click', () => handleDeleteStudent(b.getAttribute('data-id')));
     });
+
+    container.querySelectorAll('.btn-toggle-status-student-admin').forEach(b => {
+      b.addEventListener('click', () => handleToggleStudentStatus(b.getAttribute('data-id'), b.getAttribute('data-status')));
+    });
   } catch (err) {
     container.innerHTML = `<p style="color:var(--danger); text-align:center;">${err.message}</p>`;
   }
+}
+
+function isBirthdayMonth(isoDate) {
+  if (!isoDate) return false;
+  return parseInt(String(isoDate).slice(5, 7)) === new Date().getMonth() + 1;
+}
+
+function handleToggleStudentStatus(studentId, currentStatus) {
+  const activating = currentStatus !== 'ativo';
+  const msg = activating
+    ? 'Reativar este aluno? Ele volta a aparecer nas listas (os horários da grade precisam ser recriados).'
+    : 'Inativar este aluno? Ele sai da grade de horários, mas todo o histórico (aulas, faturas, relatórios) é mantido.';
+  showAppConfirm(msg, async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/students/${studentId}`, {
+        method: 'PUT',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ status: activating ? 'ativo' : 'inativo' })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Erro ao alterar status');
+      showToast(activating ? 'Aluno reativado.' : 'Aluno inativado.');
+      loadAdminStudents();
+      loadStudents();
+      loadStats();
+      loadSchedules();
+    } catch (err) {
+      showAppAlert(err.message, 'Status do Aluno');
+    }
+  }, activating ? 'Reativar Aluno' : 'Inativar Aluno', !activating);
 }
 
 async function openStudentModalAdmin(studentId = null) {
@@ -1585,6 +1798,11 @@ async function openStudentModalAdmin(studentId = null) {
     document.getElementById('student-start-date').value = student.start_date || '';
     document.getElementById('student-end-date').value = student.end_date || '';
     document.getElementById('student-status').value = student.status || 'ativo';
+    document.getElementById('student-birth-date').value = student.birth_date ? String(student.birth_date).slice(0, 10) : '';
+    document.getElementById('student-address').value = student.address || '';
+    document.getElementById('student-school-name').value = student.school_name || '';
+    document.getElementById('student-school-contact').value = student.school_contact_name || '';
+    document.getElementById('student-school-phone').value = student.school_phone || '';
 
     // Frequência e Matrícula
     if (freqSelect) {
@@ -2648,6 +2866,11 @@ function setupEventListeners() {
       start_date: document.getElementById('student-start-date').value,
       end_date: document.getElementById('student-end-date').value,
       status: document.getElementById('student-status').value,
+      birth_date: document.getElementById('student-birth-date').value || null,
+      address: document.getElementById('student-address').value,
+      school_name: document.getElementById('student-school-name').value,
+      school_contact_name: document.getElementById('student-school-contact').value,
+      school_phone: document.getElementById('student-school-phone').value,
       frequency_type: document.getElementById('student-frequency-type') ? document.getElementById('student-frequency-type').value : 'semanal',
       custom_interval_days: document.getElementById('student-custom-days') ? parseInt(document.getElementById('student-custom-days').value) : 7,
       preferred_days: prefDaysArr.join(','),
@@ -2699,6 +2922,7 @@ function setupEventListeners() {
   document.getElementById('btn-cancel-teacher').addEventListener('click', () => {
     document.getElementById('modal-teacher-admin').classList.add('hidden');
   });
+  document.getElementById('btn-upload-teacher-doc').addEventListener('click', uploadTeacherDocument);
 
   // Submissão do Professor no Admin
   document.getElementById('form-teacher-admin').addEventListener('submit', async (e) => {
@@ -2709,6 +2933,7 @@ function setupEventListeners() {
     const payload = {
       name: document.getElementById('teacher-name').value,
       email: document.getElementById('teacher-email').value,
+      phone: document.getElementById('teacher-phone').value,
       password: document.getElementById('teacher-password').value || undefined,
       role: document.getElementById('teacher-role').value,
       status: document.getElementById('teacher-status').value,
@@ -6810,62 +7035,252 @@ function setupPortalManagementUI() {
 }
 
 // ==========================================
-// 6. GESTÃO DE LEADS & PRÉ-MATRÍCULAS (ADMIN)
+// 6. GESTÃO DE LEADS & PRÉ-MATRÍCULAS (ADMIN - KANBAN)
 // ==========================================
+const LEAD_COLUMNS = [
+  { id: 'novo', title: 'Novo Contato', icon: '🟡', desc: 'Chegou pelo site ou cadastro' },
+  { id: 'contatado', title: 'Em Atendimento', icon: '💬', desc: 'Primeiro contato realizado' },
+  { id: 'agendado', title: 'Aula Experimental', icon: '📅', desc: 'Visita ou aula agendada' },
+  { id: 'matriculado', title: 'Matriculado', icon: '🎉', desc: 'Matrícula confirmada' },
+  { id: 'arquivado', title: 'Arquivado', icon: '⚪', desc: 'Desistiu ou sem interesse' }
+];
+
+const LEAD_SOURCE_INFO = {
+  site: { label: 'Site', icon: '🌐' },
+  whatsapp: { label: 'WhatsApp', icon: '💬' },
+  instagram: { label: 'Instagram', icon: '📸' },
+  facebook: { label: 'Facebook', icon: '👍' },
+  indicacao: { label: 'Indicação', icon: '🤝' },
+  telefone: { label: 'Telefone', icon: '📞' },
+  presencial: { label: 'Presencial', icon: '🏫' },
+  outro: { label: 'Outro', icon: '📌' }
+};
+
+let leadSearchQuery = '';
+let leadSourceFilter = '';
+
 async function loadAdminLeads() {
-  const tbody = document.getElementById('admin-leads-tbody');
-  if (!tbody) return;
+  const kanban = document.getElementById('leads-kanban');
+  if (!kanban) return;
 
   try {
-    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">Carregando interessados...</td></tr>';
+    kanban.innerHTML = '<div style="grid-column:1/-1; text-align:center; padding:30px;" class="text-muted">Carregando funil de interessados...</div>';
     const res = await fetch(`${API_BASE}/api/leads`, { headers: getAuthHeaders() });
     if (!res.ok) throw new Error('Falha ao carregar leads');
-    const leads = await res.json();
-    state.adminLeads = leads;
+    state.adminLeads = await res.json();
+    renderLeadsKanban();
+  } catch (err) {
+    kanban.innerHTML = `<div style="grid-column:1/-1; text-align:center; padding:30px; color:var(--danger);">${escapeHtmlDoc(err.message)}</div>`;
+  }
+}
 
-    if (leads.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-4">Nenhum novo contato captado no momento.</td></tr>';
-      return;
+function renderLeadsKanban() {
+  const kanban = document.getElementById('leads-kanban');
+  if (!kanban) return;
+
+  const leads = state.adminLeads || [];
+  const search = (leadSearchQuery || '').toLowerCase().trim();
+  const source = leadSourceFilter || '';
+
+  const filtered = leads.filter(l => {
+    if (source && (l.source || 'site') !== source) return false;
+    if (search) {
+      const matchName = (l.name || '').toLowerCase().includes(search);
+      const matchPhone = (l.phone || '').toLowerCase().includes(search);
+      const matchEmail = (l.email || '').toLowerCase().includes(search);
+      const matchCourse = (l.course_interest || '').toLowerCase().includes(search);
+      const matchGrade = (l.student_grade || '').toLowerCase().includes(search);
+      const matchMsg = (l.message || '').toLowerCase().includes(search);
+      const matchNotes = (l.notes || '').toLowerCase().includes(search);
+      if (!matchName && !matchPhone && !matchEmail && !matchCourse && !matchGrade && !matchMsg && !matchNotes) return false;
     }
+    return true;
+  });
 
-    tbody.innerHTML = leads.map(l => {
+  const columnsHtml = LEAD_COLUMNS.map((col, colIdx) => {
+    const colLeads = filtered.filter(l => (l.status || 'novo') === col.id);
+    const prevCol = colIdx > 0 ? LEAD_COLUMNS[colIdx - 1] : null;
+    const nextCol = colIdx < LEAD_COLUMNS.length - 1 ? LEAD_COLUMNS[colIdx + 1] : null;
+
+    const cardsHtml = colLeads.map(l => {
+      const srcInfo = LEAD_SOURCE_INFO[l.source] || LEAD_SOURCE_INFO['site'];
       const cleanPhone = (l.phone || '').replace(/\D/g, '');
-      const waLink = cleanPhone ? `https://wa.me/55${cleanPhone}?text=${encodeURIComponent(`Olá ${l.name}, tudo bem? Aqui é da Escola Entrelinhas sobre seu interesse em ${l.course_interest || 'nossos cursos'}!`)}` : '#';
+      const waLink = cleanPhone
+        ? `https://wa.me/55${cleanPhone}?text=${encodeURIComponent(`Olá ${l.name}, tudo bem? Aqui é da Escola Entrelinhas sobre seu interesse em ${l.course_interest || 'nossos cursos'}!`)}`
+        : null;
+
+      const dateStr = l.created_at ? new Date(l.created_at).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) : '';
 
       return `
-        <tr>
-          <td>
-            <strong>${l.name}</strong>
-            <small class="text-muted" style="display:block;">${l.email || 'Sem e-mail'}</small>
-          </td>
-          <td>
-            <a href="${waLink}" target="_blank" rel="noopener" style="color:#16a34a; font-weight:700; text-decoration:none; display:inline-flex; align-items:center; gap:4px;">
-              📱 ${l.phone}
-            </a>
-          </td>
-          <td><strong>${l.course_interest || 'Geral'}</strong></td>
-          <td>${l.student_grade || 'N/I'}</td>
-          <td>
-            <select onchange="updateLeadStatus(${l.id}, this.value)" style="padding:4px 8px; border-radius:6px; border:1px solid #cbd5e1; font-size:0.8rem; font-weight:700;">
-              <option value="novo" ${l.status === 'novo' ? 'selected' : ''}>🟡 Novo</option>
-              <option value="contatado" ${l.status === 'contatado' ? 'selected' : ''}>💬 Em Atendimento</option>
-              <option value="agendado" ${l.status === 'agendado' ? 'selected' : ''}>📅 Aula Experimental Agendada</option>
-              <option value="matriculado" ${l.status === 'matriculado' ? 'selected' : ''}>🎉 Matriculado</option>
-              <option value="arquivado" ${l.status === 'arquivado' ? 'selected' : ''}>⚪ Arquivado</option>
-            </select>
-          </td>
-          <td style="max-width:200px; font-size:0.8rem; color:#475569;">${l.message || 'Sem observações'}</td>
-          <td>
-            <button type="button" class="btn-sm-action" onclick="deleteLead(${l.id})" style="background:#fee2e2; color:#dc2626; border:none; padding:4px 8px; border-radius:6px; font-weight:700; cursor:pointer;" title="Excluir Lead">
-              🗑️
-            </button>
-          </td>
-        </tr>
+        <div class="lead-card" draggable="true" data-id="${l.id}">
+          <div class="lead-card-header">
+            <span class="lead-source-tag">${srcInfo.icon} ${srcInfo.label}</span>
+            ${dateStr ? `<span class="lead-date-tag">${dateStr}</span>` : ''}
+          </div>
+          <div class="lead-card-title" title="Clique para editar">${escapeHtmlDoc(l.name)}</div>
+          ${l.course_interest ? `<div class="lead-card-course">📚 <strong>${escapeHtmlDoc(l.course_interest)}</strong>${l.student_grade ? ' • ' + escapeHtmlDoc(l.student_grade) : ''}</div>` : ''}
+          ${l.message ? `<div class="lead-card-msg" title="${escapeHtmlDoc(l.message)}">💬 ${escapeHtmlDoc(l.message)}</div>` : ''}
+          ${l.notes ? `<div class="lead-card-notes" title="${escapeHtmlDoc(l.notes)}">📌 ${escapeHtmlDoc(l.notes)}</div>` : ''}
+          
+          <div class="lead-card-contacts">
+            ${waLink ? `
+              <a href="${waLink}" target="_blank" rel="noopener" class="lead-wa-btn" title="Abrir conversa no WhatsApp">
+                📱 <span>${escapeHtmlDoc(l.phone)}</span>
+              </a>
+            ` : `<span class="text-xs text-muted">📞 ${escapeHtmlDoc(l.phone || 'Sem telefone')}</span>`}
+          </div>
+
+          <div class="lead-card-actions">
+            <div class="lead-nav-btns">
+              ${prevCol ? `<button type="button" class="btn-lead-step btn-step-prev" data-id="${l.id}" data-target="${prevCol.id}" title="Mover para ${prevCol.title}">◀</button>` : '<span class="step-placeholder"></span>'}
+              <button type="button" class="btn-lead-edit" data-id="${l.id}" title="Editar lead">✏️</button>
+              <button type="button" class="btn-lead-del" data-id="${l.id}" title="Excluir">🗑️</button>
+              ${nextCol ? `<button type="button" class="btn-lead-step btn-step-next" data-id="${l.id}" data-target="${nextCol.id}" title="Mover para ${nextCol.title}">▶</button>` : '<span class="step-placeholder"></span>'}
+            </div>
+          </div>
+        </div>
       `;
     }).join('');
-  } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger">Erro ao carregar leads.</td></tr>';
+
+    return `
+      <div class="kanban-col kanban-col-${col.id}">
+        <div class="kanban-col-header">
+          <div class="kanban-col-title-box">
+            <span class="kanban-col-icon">${col.icon}</span>
+            <div>
+              <span class="kanban-col-title">${col.title}</span>
+              <span class="kanban-col-desc">${col.desc}</span>
+            </div>
+          </div>
+          <span class="kanban-col-count">${colLeads.length}</span>
+        </div>
+        <div class="kanban-col-body" data-status="${col.id}">
+          ${cardsHtml.length > 0 ? cardsHtml : '<div class="kanban-empty-drop text-muted text-xs">Arraste um lead para cá</div>'}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  kanban.innerHTML = columnsHtml;
+  bindKanbanInteractions();
+}
+
+function bindKanbanInteractions() {
+  const kanban = document.getElementById('leads-kanban');
+  if (!kanban) return;
+
+  // Drag & drop
+  kanban.querySelectorAll('.lead-card').forEach(card => {
+    card.addEventListener('dragstart', (e) => {
+      card.classList.add('dragging');
+      e.dataTransfer.setData('text/plain', card.dataset.id);
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    card.addEventListener('dragend', () => {
+      card.classList.remove('dragging');
+      kanban.querySelectorAll('.kanban-col-body').forEach(b => b.classList.remove('drag-over'));
+    });
+  });
+
+  kanban.querySelectorAll('.kanban-col-body').forEach(colBody => {
+    colBody.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      colBody.classList.add('drag-over');
+    });
+    colBody.addEventListener('dragleave', (e) => {
+      if (!colBody.contains(e.relatedTarget)) {
+        colBody.classList.remove('drag-over');
+      }
+    });
+    colBody.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      colBody.classList.remove('drag-over');
+      const leadId = e.dataTransfer.getData('text/plain');
+      const targetStatus = colBody.dataset.status;
+      if (!leadId || !targetStatus) return;
+
+      const current = (state.adminLeads || []).find(l => String(l.id) === String(leadId));
+      if (current && current.status === targetStatus) return;
+
+      await updateLeadStatus(leadId, targetStatus);
+    });
+  });
+
+  // Botões de navegação rápida de etapa (◀ e ▶)
+  kanban.querySelectorAll('.btn-lead-step').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const leadId = btn.dataset.id;
+      const target = btn.dataset.target;
+      if (leadId && target) updateLeadStatus(leadId, target);
+    });
+  });
+
+  // Botão de editar
+  kanban.querySelectorAll('.btn-lead-edit').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openLeadModal(btn.dataset.id);
+    });
+  });
+
+  // Clique no título do card para editar
+  kanban.querySelectorAll('.lead-card-title').forEach(titleEl => {
+    titleEl.addEventListener('click', () => {
+      const card = titleEl.closest('.lead-card');
+      if (card) openLeadModal(card.dataset.id);
+    });
+  });
+
+  // Botão de excluir
+  kanban.querySelectorAll('.btn-lead-del').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteLead(btn.dataset.id);
+    });
+  });
+}
+
+function openLeadModal(leadId = null) {
+  const modal = document.getElementById('modal-lead-admin');
+  const form = document.getElementById('form-lead-admin');
+  const title = document.getElementById('lead-modal-title');
+  const delBtn = document.getElementById('btn-delete-lead');
+  if (!modal || !form) return;
+
+  form.reset();
+
+  if (leadId) {
+    const lead = (state.adminLeads || []).find(l => String(l.id) === String(leadId));
+    if (!lead) return;
+
+    title.textContent = 'Editar Lead';
+    document.getElementById('lead-edit-id').value = lead.id;
+    document.getElementById('lead-name').value = lead.name || '';
+    document.getElementById('lead-phone').value = lead.phone || '';
+    document.getElementById('lead-email').value = lead.email || '';
+    document.getElementById('lead-course').value = lead.course_interest || '';
+    document.getElementById('lead-grade').value = lead.student_grade || '';
+    document.getElementById('lead-source').value = lead.source || 'site';
+    document.getElementById('lead-status').value = lead.status || 'novo';
+    document.getElementById('lead-message').value = lead.message || '';
+    document.getElementById('lead-notes').value = lead.notes || '';
+    if (delBtn) delBtn.classList.remove('hidden');
+  } else {
+    title.textContent = 'Novo Lead (Cadastro Manual)';
+    document.getElementById('lead-edit-id').value = '';
+    document.getElementById('lead-source').value = 'whatsapp';
+    document.getElementById('lead-status').value = 'novo';
+    if (delBtn) delBtn.classList.add('hidden');
   }
+
+  modal.classList.remove('hidden');
+}
+
+function closeLeadModal() {
+  const modal = document.getElementById('modal-lead-admin');
+  if (modal) modal.classList.add('hidden');
 }
 
 async function updateLeadStatus(leadId, newStatus) {
@@ -6875,27 +7290,107 @@ async function updateLeadStatus(leadId, newStatus) {
       headers: getAuthHeaders(),
       body: JSON.stringify({ status: newStatus })
     });
-    if (!res.ok) throw new Error('Falha ao atualizar status');
-    showToast('Status do contato atualizado com sucesso.');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Falha ao atualizar etapa');
+    
+    // Atualiza otimista no state
+    const item = (state.adminLeads || []).find(l => String(l.id) === String(leadId));
+    if (item) item.status = newStatus;
+    renderLeadsKanban();
+    showToast('Etapa do lead atualizada!');
   } catch (err) {
     showAppAlert(err.message, 'Atualizar Lead');
   }
 }
 
 async function deleteLead(leadId) {
-  showAppConfirm('Tem certeza de que deseja remover este contato?', async () => {
+  showAppConfirm('Tem certeza de que deseja remover este interessado?', async () => {
     try {
       const res = await fetch(`${API_BASE}/api/leads/${leadId}`, {
         method: 'DELETE',
         headers: getAuthHeaders()
       });
       if (!res.ok) throw new Error('Falha ao remover lead');
-      showToast('Contato removido.');
+      showToast('Lead removido com sucesso.');
+      closeLeadModal();
       loadAdminLeads();
     } catch (err) {
-      showAppAlert(err.message, 'Remover Contato');
+      showAppAlert(err.message, 'Remover Lead');
     }
-  }, 'Excluir Contato', true);
+  }, 'Excluir Lead', true);
+}
+
+function setupLeadsEvents() {
+  const btnAdd = document.getElementById('btn-add-lead');
+  if (btnAdd) btnAdd.addEventListener('click', () => openLeadModal(null));
+
+  const btnClose = document.getElementById('btn-close-lead-modal');
+  if (btnClose) btnClose.addEventListener('click', closeLeadModal);
+
+  const btnCancel = document.getElementById('btn-cancel-lead');
+  if (btnCancel) btnCancel.addEventListener('click', closeLeadModal);
+
+  const btnDel = document.getElementById('btn-delete-lead');
+  if (btnDel) {
+    btnDel.addEventListener('click', () => {
+      const id = document.getElementById('lead-edit-id').value;
+      if (id) deleteLead(id);
+    });
+  }
+
+  const searchInput = document.getElementById('input-leads-search');
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => {
+      leadSearchQuery = e.target.value;
+      renderLeadsKanban();
+    });
+  }
+
+  const sourceFilter = document.getElementById('select-leads-source-filter');
+  if (sourceFilter) {
+    sourceFilter.addEventListener('change', (e) => {
+      leadSourceFilter = e.target.value;
+      renderLeadsKanban();
+    });
+  }
+
+  const form = document.getElementById('form-lead-admin');
+  if (form) {
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const editId = document.getElementById('lead-edit-id').value;
+      const payload = {
+        name: document.getElementById('lead-name').value.trim(),
+        phone: document.getElementById('lead-phone').value.trim(),
+        email: document.getElementById('lead-email').value.trim() || null,
+        course_interest: document.getElementById('lead-course').value.trim() || null,
+        student_grade: document.getElementById('lead-grade').value.trim() || null,
+        source: document.getElementById('lead-source').value,
+        status: document.getElementById('lead-status').value,
+        message: document.getElementById('lead-message').value.trim() || null,
+        notes: document.getElementById('lead-notes').value.trim() || null
+      };
+
+      const url = editId ? `${API_BASE}/api/leads/${editId}` : `${API_BASE}/api/leads/manual`;
+      const method = editId ? 'PATCH' : 'POST';
+
+      try {
+        const res = await fetch(url, {
+          method,
+          headers: getAuthHeaders(),
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Erro ao salvar lead');
+
+        showToast(editId ? 'Lead atualizado com sucesso!' : 'Lead cadastrado com sucesso!');
+        closeLeadModal();
+        loadAdminLeads();
+      } catch (err) {
+        showAppAlert(err.message, 'Cadastro de Lead');
+      }
+    });
+  }
 }
 
 // Exportações e atalhos globais

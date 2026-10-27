@@ -436,6 +436,33 @@ async function initDB(seedDataFn) {
         ALTER TABLE teacher_schedules ADD COLUMN IF NOT EXISTS live_meeting_url VARCHAR(255);
         ALTER TABLE classrooms ADD COLUMN IF NOT EXISTS live_meeting_url VARCHAR(255);
 
+        -- Dados complementares do aluno (endereço, nascimento, colégio)
+        ALTER TABLE leads_contacts ADD COLUMN IF NOT EXISTS source VARCHAR(30) DEFAULT 'site';
+        ALTER TABLE leads_contacts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+        ALTER TABLE students ADD COLUMN IF NOT EXISTS address TEXT;
+        ALTER TABLE students ADD COLUMN IF NOT EXISTS birth_date DATE;
+        ALTER TABLE students ADD COLUMN IF NOT EXISTS school_name VARCHAR(150);
+        ALTER TABLE students ADD COLUMN IF NOT EXISTS school_contact_name VARCHAR(150);
+        ALTER TABLE students ADD COLUMN IF NOT EXISTS school_phone VARCHAR(50);
+
+        -- Contato do professor
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
+
+        -- Documentos dos professores (currículo, contrato, certificados...)
+        CREATE TABLE IF NOT EXISTS teacher_documents (
+          id SERIAL PRIMARY KEY,
+          teacher_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          category VARCHAR(40) NOT NULL DEFAULT 'outro',
+          description VARCHAR(200),
+          file_name VARCHAR(255) NOT NULL,
+          mime_type VARCHAR(120),
+          size_bytes INT,
+          data BYTEA NOT NULL,
+          uploaded_by INT REFERENCES users(id) ON DELETE SET NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_teacher_documents_teacher ON teacher_documents(teacher_id);
+
         -- Ajusta timezone da sessão para padrão São Paulo / Brasil
         SET timezone = 'America/Sao_Paulo';
       `);

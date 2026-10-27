@@ -11,7 +11,10 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+// Upload de documentos de professor vem em base64 no JSON: limite maior só nessa rota
+const jsonDefault = express.json();
+const jsonLarge = express.json({ limit: '15mb' });
+app.use((req, res, next) => (/^\/api\/teachers\/\d+\/documents$/.test(req.path) && req.method === 'POST' ? jsonLarge : jsonDefault)(req, res, next));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Configuração padrão de Data e Hora: Brasil / São Paulo (America/Sao_Paulo)
@@ -655,7 +658,8 @@ app.get('/api/teachers', authenticateToken, requireRole('admin', 'professor'), a
   try {
     const result = await pool.query(`
       SELECT 
-        u.id, u.name, u.email, u.role, u.status, u.created_at,
+        u.id, u.name, u.email, u.phone, u.role, u.status, u.created_at,
+        (SELECT COUNT(*) FROM teacher_documents td WHERE td.teacher_id = u.id) as total_documents,
         COALESCE(
           json_agg(DISTINCT jsonb_build_object('id', s.id, 'name', s.name, 'code', s.code)) 
           FILTER (WHERE s.id IS NOT NULL), '[]'
@@ -681,7 +685,7 @@ app.get('/api/teachers', authenticateToken, requireRole('admin', 'professor'), a
 app.post('/api/teachers', authenticateToken, requireAdmin, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { name, email, password, role = 'professor', subject_ids = [] } = req.body;
+    const { name, email, password, role = 'professor', subject_ids = [], phone } = req.body;
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Nome, e-mail e senha são obrigatórios.' });
     }
@@ -697,10 +701,10 @@ app.post('/api/teachers', authenticateToken, requireAdmin, async (req, res) => {
     await client.query('BEGIN');
     const { hash, salt } = hashPassword(password);
     const userRes = await client.query(`
-      INSERT INTO users (name, email, password_hash, salt, role, status)
-      VALUES ($1, $2, $3, $4, $5, 'ativo')
-      RETURNING id, name, email, role, status, created_at
-    `, [name.trim(), email.trim().toLowerCase(), hash, salt, role]);
+      INSERT INTO users (name, email, password_hash, salt, role, status, phone)
+      VALUES ($1, $2, $3, $4, $5, 'ativo', $6)
+      RETURNING id, name, email, phone, role, status, created_at
+    `, [name.trim(), email.trim().toLowerCase(), hash, salt, role, (phone || '').trim() || null]);
     const newTeacher = userRes.rows[0];
 
     if (Array.isArray(subject_ids) && subject_ids.length > 0) {
@@ -741,7 +745,7 @@ app.put('/api/teachers/:id', authenticateToken, requireAdmin, async (req, res) =
   const client = await pool.connect();
   try {
     const id = parseInt(req.params.id);
-    const { name, email, password, role, status, subject_ids } = req.body;
+    const { name, email, password, role, status, subject_ids, phone } = req.body;
 
     if (role && !['admin', 'professor'].includes(role)) {
       return res.status(400).json({ error: 'Perfil inválido. Use "admin" ou "professor".' });
@@ -784,10 +788,12 @@ app.put('/api/teachers/:id', authenticateToken, requireAdmin, async (req, res) =
       SET name = COALESCE($1, name),
           email = COALESCE($2, email),
           role = COALESCE($3, role),
-          status = COALESCE($4, status)
+          status = COALESCE($4, status),
+          phone = CASE WHEN $6::boolean THEN $7 ELSE phone END
       WHERE id = $5
-      RETURNING id, name, email, role, status
-    `, [name ? name.trim() : null, email ? email.trim().toLowerCase() : null, role || null, status || null, id]);
+      RETURNING id, name, email, phone, role, status
+    `, [name ? name.trim() : null, email ? email.trim().toLowerCase() : null, role || null, status || null, id,
+        phone !== undefined, phone !== undefined ? (String(phone || '').trim() || null) : null]);
 
     if (updateRes.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -861,6 +867,72 @@ app.delete('/api/teachers/:id', authenticateToken, requireAdmin, async (req, res
 });
 
 // ==========================================
+// DOCUMENTOS DOS PROFESSORES (Admin)
+// ==========================================
+const TEACHER_DOC_CATEGORIES = ['curriculo', 'documento_pessoal', 'contrato', 'certificado', 'outro'];
+const MAX_DOC_BYTES = 10 * 1024 * 1024;
+
+app.get('/api/teachers/:id/documents', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT id, teacher_id, category, description, file_name, mime_type, size_bytes, created_at
+      FROM teacher_documents WHERE teacher_id = $1 ORDER BY created_at DESC
+    `, [parseInt(req.params.id)]);
+    res.json(r.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/teachers/:id/documents', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const teacherId = parseInt(req.params.id);
+    const { file_name, mime_type, data_base64, category = 'outro', description } = req.body;
+    if (!file_name || !data_base64) return res.status(400).json({ error: 'Selecione um arquivo para enviar.' });
+    if (!TEACHER_DOC_CATEGORIES.includes(category)) return res.status(400).json({ error: 'Tipo de documento inválido.' });
+    const exists = await pool.query('SELECT 1 FROM users WHERE id = $1', [teacherId]);
+    if (exists.rows.length === 0) return res.status(404).json({ error: 'Professor não encontrado.' });
+
+    const buffer = Buffer.from(String(data_base64).replace(/^data:[^,]*,/, ''), 'base64');
+    if (buffer.length === 0) return res.status(400).json({ error: 'Arquivo vazio.' });
+    if (buffer.length > MAX_DOC_BYTES) return res.status(400).json({ error: 'O arquivo passa do limite de 10 MB.' });
+
+    const r = await pool.query(`
+      INSERT INTO teacher_documents (teacher_id, category, description, file_name, mime_type, size_bytes, data, uploaded_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING id, teacher_id, category, description, file_name, mime_type, size_bytes, created_at
+    `, [teacherId, category, (description || '').trim() || null, String(file_name).slice(0, 255),
+        mime_type || 'application/octet-stream', buffer.length, buffer, req.user.id]);
+    res.status(201).json(r.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/teacher-documents/:docId/download', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT file_name, mime_type, data FROM teacher_documents WHERE id = $1', [parseInt(req.params.docId)]);
+    const doc = r.rows[0];
+    if (!doc) return res.status(404).json({ error: 'Documento não encontrado.' });
+    res.setHeader('Content-Type', doc.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(doc.file_name)}`);
+    res.send(doc.data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/teacher-documents/:docId', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query('DELETE FROM teacher_documents WHERE id = $1 RETURNING id', [parseInt(req.params.docId)]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Documento não encontrado.' });
+    res.json({ message: 'Documento removido.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
 // ROTAS DE GESTÃO DE ALUNOS
 // ==========================================
 
@@ -869,6 +941,8 @@ app.delete('/api/teachers/:id', authenticateToken, requireAdmin, async (req, res
 const STUDENT_SELECT = `
   SELECT
     st.*,
+    to_char(st.birth_date, 'YYYY-MM-DD') as birth_date,
+    to_char(st.birth_date, 'DD/MM') as birthday_br,
     u_teach.name as assigned_teacher_name,
     u_teach.email as assigned_teacher_email,
     COALESCE((
@@ -1041,6 +1115,7 @@ async function validateStudentPayload(db, body, studentId = null) {
     return 'A duração da aula deve ficar entre 15 e 480 minutos.';
   }
   if (status && !['ativo', 'inativo'].includes(status)) return 'Status do aluno inválido.';
+  if (body.birth_date && !/^\d{4}-\d{2}-\d{2}$/.test(body.birth_date)) return 'Data de nascimento inválida.';
   if (parent_access_code && parent_access_code.trim()) {
     const dup = await db.query(
       'SELECT id FROM students WHERE UPPER(parent_access_code) = UPPER($1) AND ($2::int IS NULL OR id <> $2)',
@@ -1074,7 +1149,8 @@ app.post('/api/students', authenticateToken, requireRole('admin'), async (req, r
       name, objective_grade, start_date, end_date,
       parent_name, parent_email, parent_phone, parent_access_code,
       subject_ids, frequency_type, custom_interval_days, preferred_days, preferred_time,
-      duration_minutes, assigned_teacher_id, enrollment_notes
+      duration_minutes, assigned_teacher_id, enrollment_notes,
+      address, birth_date, school_name, school_contact_name, school_phone
     } = req.body;
 
     if (!name || !name.trim()) {
@@ -1101,9 +1177,10 @@ app.post('/api/students', authenticateToken, requireRole('admin'), async (req, r
         name, objective_grade, start_date, end_date, status,
         parent_name, parent_email, parent_phone, parent_access_code,
         frequency_type, custom_interval_days, preferred_days, preferred_time, duration_minutes,
-        enrollment_status, assigned_teacher_id, enrollment_notes
+        enrollment_status, assigned_teacher_id, enrollment_notes,
+        address, birth_date, school_name, school_contact_name, school_phone
        )
-       VALUES ($1, $2, $3, $4, 'ativo', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+       VALUES ($1, $2, $3, $4, 'ativo', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
        RETURNING *`,
       [
         name.trim(),
@@ -1121,7 +1198,12 @@ app.post('/api/students', authenticateToken, requireRole('admin'), async (req, r
         duration_minutes ? parseInt(duration_minutes) : 60,
         teacher ? 'ativo' : 'aguardando_professor',
         teacher ? teacher.id : null,
-        enrollment_notes || null
+        enrollment_notes || null,
+        (address || '').trim() || null,
+        birth_date || null,
+        (school_name || '').trim() || null,
+        (school_contact_name || '').trim() || null,
+        (school_phone || '').trim() || null
       ]
     );
     const newStudent = studentRes.rows[0];
@@ -1264,6 +1346,15 @@ app.put('/api/students/:id', authenticateToken, requireRole('admin'), async (req
       body.enrollment_notes ?? null,
       id
     ]);
+
+    // Dados complementares: aceitam limpar o campo (string vazia vira NULL)
+    const extraFields = ['address', 'birth_date', 'school_name', 'school_contact_name', 'school_phone'];
+    for (const f of extraFields) {
+      if (has(f)) {
+        const v = body[f] === null || body[f] === undefined ? null : (String(body[f]).trim() || null);
+        await client.query(`UPDATE students SET ${f} = $1 WHERE id = $2`, [v, id]);
+      }
+    }
 
     if (Array.isArray(body.subject_ids)) {
       await client.query('DELETE FROM student_subjects WHERE student_id = $1', [id]);
@@ -2228,7 +2319,22 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
         FROM class_logs cl
         WHERE cl.teacher_id = $1
       `, [req.user.id]);
-      return res.json(profStats.rows[0]);
+      const bdays = await pool.query(`
+        SELECT id, name,
+               to_char(birth_date, 'YYYY-MM-DD') as birth_date,
+               to_char(birth_date, 'DD/MM') as birthday_br,
+               EXTRACT(DAY FROM birth_date)::int as birth_day,
+               school_name
+        FROM students st
+        WHERE st.status = 'ativo'
+          AND st.birth_date IS NOT NULL
+          AND EXTRACT(MONTH FROM st.birth_date) = EXTRACT(MONTH FROM CURRENT_DATE)
+          AND ${teacherStudentsSQL('st', '$1')}
+        ORDER BY EXTRACT(DAY FROM st.birth_date) ASC, st.name ASC
+      `, [req.user.id]);
+      const data = profStats.rows[0];
+      data.birthdays = bdays.rows;
+      return res.json(data);
     }
 
     if (req.user.role === 'responsavel') {
@@ -2243,7 +2349,9 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
         FROM class_logs cl
         WHERE cl.student_id = $1
       `, [req.user.student_id]);
-      return res.json(famStats.rows[0]);
+      const data = famStats.rows[0];
+      data.birthdays = [];
+      return res.json(data);
     }
 
     const statsQuery = `
@@ -2256,7 +2364,21 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
         (SELECT COUNT(*) FROM class_logs WHERE status = 'falta') as total_absences
     `;
     const result = await pool.query(statsQuery);
-    res.json(result.rows[0]);
+    const bdays = await pool.query(`
+      SELECT id, name,
+             to_char(birth_date, 'YYYY-MM-DD') as birth_date,
+             to_char(birth_date, 'DD/MM') as birthday_br,
+             EXTRACT(DAY FROM birth_date)::int as birth_day,
+             school_name
+      FROM students
+      WHERE status = 'ativo'
+        AND birth_date IS NOT NULL
+        AND EXTRACT(MONTH FROM birth_date) = EXTRACT(MONTH FROM CURRENT_DATE)
+      ORDER BY EXTRACT(DAY FROM birth_date) ASC, name ASC
+    `);
+    const data = result.rows[0];
+    data.birthdays = bdays.rows;
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3344,7 +3466,7 @@ app.get('/api/leads', authenticateToken, requireAdmin, async (req, res) => {
       SELECT * FROM leads_contacts 
       ORDER BY 
         CASE status WHEN 'novo' THEN 1 WHEN 'contatado' THEN 2 WHEN 'agendado' THEN 3 ELSE 4 END,
-        created_at DESC
+        COALESCE(updated_at, created_at) DESC
     `);
     res.json(result.rows);
   } catch (err) {
@@ -3352,24 +3474,60 @@ app.get('/api/leads', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
-// Atualizar status e anotações do lead (Admin)
+// Cadastro manual de lead pela coordenação (Admin)
+const LEAD_STATUSES = ['novo', 'contatado', 'agendado', 'matriculado', 'arquivado'];
+const LEAD_SOURCES = ['site', 'whatsapp', 'instagram', 'facebook', 'indicacao', 'telefone', 'presencial', 'outro'];
+
+app.post('/api/leads/manual', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { name, phone, email, course_interest, student_grade, message, notes, status = 'novo', source = 'outro' } = req.body;
+    if (!name || !name.trim() || !phone || !phone.trim()) {
+      return res.status(400).json({ error: 'Nome e telefone são obrigatórios.' });
+    }
+    if (!LEAD_STATUSES.includes(status)) return res.status(400).json({ error: 'Etapa inválida.' });
+    if (!LEAD_SOURCES.includes(source)) return res.status(400).json({ error: 'Origem inválida.' });
+    const result = await pool.query(`
+      INSERT INTO leads_contacts (name, phone, email, course_interest, student_grade, message, notes, status, source)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *
+    `, [name.trim(), phone.trim(), (email || '').trim() || null, (course_interest || '').trim() || null,
+        (student_grade || '').trim() || null, (message || '').trim() || null, (notes || '').trim() || null, status, source]);
+    res.status(201).json({ message: 'Lead cadastrado!', lead: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Atualizar etapa e dados do lead (Admin)
 app.patch('/api/leads/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { id } = req.params;
-    const { status, notes } = req.body;
-    if (status && !['novo', 'contatado', 'agendado', 'matriculado', 'arquivado'].includes(status)) {
+    const id = parseInt(req.params.id);
+    const body = req.body;
+    if (body.status && !LEAD_STATUSES.includes(body.status)) {
       return res.status(400).json({ error: 'Status do contato inválido.' });
     }
-    const result = await pool.query(`
-      UPDATE leads_contacts
-      SET status = COALESCE($1, status),
-          notes = COALESCE($2, notes)
-      WHERE id = $3
-      RETURNING *
-    `, [status, notes, id]);
+    if (body.source && !LEAD_SOURCES.includes(body.source)) {
+      return res.status(400).json({ error: 'Origem inválida.' });
+    }
+    if (body.name !== undefined && !String(body.name).trim()) return res.status(400).json({ error: 'O nome não pode ficar vazio.' });
+    if (body.phone !== undefined && !String(body.phone).trim()) return res.status(400).json({ error: 'O telefone não pode ficar vazio.' });
+
+    const editable = ['name', 'phone', 'email', 'course_interest', 'student_grade', 'message', 'notes', 'status', 'source'];
+    const sets = [];
+    const params = [];
+    for (const f of editable) {
+      if (Object.prototype.hasOwnProperty.call(body, f)) {
+        params.push(body[f] === null ? null : (String(body[f]).trim() || null));
+        sets.push(`${f} = $${params.length}`);
+      }
+    }
+    if (sets.length === 0) return res.status(400).json({ error: 'Nada para atualizar.' });
+    sets.push('updated_at = CURRENT_TIMESTAMP');
+    params.push(id);
+    const result = await pool.query(`UPDATE leads_contacts SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`, params);
 
     if (result.rows.length === 0) return res.status(404).json({ error: 'Contato não encontrado.' });
-    res.json({ message: 'Status do interessado atualizado!', lead: result.rows[0] });
+    res.json({ message: 'Lead atualizado!', lead: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

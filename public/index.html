@@ -1042,6 +1042,17 @@
             </div>
           </div>
 
+          <!-- Aniversariantes do mês -->
+          <div class="birthdays-card" id="birthdays-card">
+            <div class="birthdays-header">
+              <span>🎂 Aniversariantes de <strong id="birthdays-month-label">-</strong></span>
+              <span class="text-xs text-muted" id="birthdays-count"></span>
+            </div>
+            <div id="birthdays-list" class="birthdays-list">
+              <p class="text-xs text-muted">Carregando...</p>
+            </div>
+          </div>
+
           <!-- Instructions Card -->
           <div class="instructions-card">
             <div class="inst-header">
@@ -1912,30 +1923,29 @@
         <section id="view-admin-leads" class="view-panel">
           <div class="panel-header">
             <div>
-              <h2>📥 Novos Contatos & Pré-Matrículas (Site)</h2>
-              <span class="panel-subtitle">Leads interessados captados diretamente pela landing page oficial</span>
+              <h2>📥 Funil de Leads & Pré-Matrículas</h2>
+              <span class="panel-subtitle">Contatos do site e cadastrados manualmente — arraste os cartões entre as etapas</span>
             </div>
+            <button type="button" class="btn-submit" id="btn-add-lead" style="width:auto; padding:10px 16px;">＋ Novo Lead</button>
           </div>
 
-          <div class="admin-table-container">
-            <div class="table-responsive">
-              <table class="data-table">
-                <thead>
-                  <tr>
-                    <th>Nome Completo</th>
-                    <th>WhatsApp / Telefone</th>
-                    <th>Curso de Interesse</th>
-                    <th>Série / Objetivo</th>
-                    <th>Status</th>
-                    <th>Mensagem / Observação</th>
-                    <th>Ações</th>
-                  </tr>
-                </thead>
-                <tbody id="admin-leads-tbody">
-                  <tr><td colspan="7" class="text-center text-muted">Carregando interessados...</td></tr>
-                </tbody>
-              </table>
-            </div>
+          <div class="leads-toolbar">
+            <input type="search" id="input-leads-search" placeholder="🔍 Buscar por nome, telefone ou curso...">
+            <select id="select-leads-source-filter">
+              <option value="">Todas as origens</option>
+              <option value="site">🌐 Site</option>
+              <option value="whatsapp">💬 WhatsApp</option>
+              <option value="instagram">📸 Instagram</option>
+              <option value="facebook">👍 Facebook</option>
+              <option value="indicacao">🤝 Indicação</option>
+              <option value="telefone">📞 Telefone</option>
+              <option value="presencial">🏫 Presencial</option>
+              <option value="outro">📌 Outro</option>
+            </select>
+          </div>
+
+          <div class="leads-kanban" id="leads-kanban">
+            <!-- Colunas geradas dinamicamente -->
           </div>
         </section>
 
@@ -2203,6 +2213,11 @@
           </div>
 
           <div class="form-group">
+            <label for="teacher-phone">Telefone / WhatsApp</label>
+            <input type="tel" id="teacher-phone" placeholder="(47) 99999-9999">
+          </div>
+
+          <div class="form-group">
             <label for="teacher-password" id="label-teacher-password">Senha de Acesso *</label>
             <input type="password" id="teacher-password" placeholder="Mínimo 6 caracteres">
             <small class="text-xs text-muted" id="hint-teacher-password">Para novo professor a senha é obrigatória.</small>
@@ -2231,9 +2246,118 @@
             </select>
           </div>
 
+          <!-- Documentos do professor (só aparece ao editar um professor já cadastrado) -->
+          <div id="group-teacher-documents" class="hidden">
+            <div class="form-section-divider">
+              <span>📎 Documentos do Professor</span>
+            </div>
+            <div class="form-row">
+              <div class="form-group flex-1">
+                <label for="teacher-doc-category">Tipo</label>
+                <select id="teacher-doc-category">
+                  <option value="curriculo">Currículo</option>
+                  <option value="documento_pessoal">Documento pessoal</option>
+                  <option value="contrato">Contrato</option>
+                  <option value="certificado">Certificado / Diploma</option>
+                  <option value="outro">Outro</option>
+                </select>
+              </div>
+              <div class="form-group flex-1">
+                <label for="teacher-doc-description">Descrição (opcional)</label>
+                <input type="text" id="teacher-doc-description" placeholder="Ex: RG frente e verso">
+              </div>
+            </div>
+            <div class="form-group">
+              <div class="input-with-button-inline">
+                <input type="file" id="teacher-doc-file" accept=".pdf,.doc,.docx,.jpg,.jpeg,.png,.webp,.odt,.txt">
+                <button type="button" id="btn-upload-teacher-doc" class="btn-action-inline"><span>⬆️ Anexar</span></button>
+              </div>
+              <small class="text-xs text-muted">PDF, Word ou imagem — até 10 MB por arquivo.</small>
+            </div>
+            <div id="teacher-documents-list" class="teacher-documents-list"></div>
+          </div>
+
           <div class="sheet-actions">
             <button type="button" class="btn-cancel" id="btn-cancel-teacher">Cancelar</button>
             <button type="submit" class="btn-submit" id="btn-save-teacher">Salvar Professor</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- ======================================================== -->
+    <!-- MODAL DO ADMIN: CADASTRAR / EDITAR LEAD -->
+    <!-- ======================================================== -->
+    <div id="modal-lead-admin" role="dialog" aria-modal="true" class="modal-backdrop hidden">
+      <div class="bottom-sheet">
+        <div class="sheet-drag-handle"></div>
+        <div class="sheet-header">
+          <h2 id="lead-modal-title">Novo Lead</h2>
+          <button type="button" id="btn-close-lead-modal" class="btn-close" aria-label="Fechar">✕</button>
+        </div>
+        <form id="form-lead-admin" class="sheet-body">
+          <input type="hidden" id="lead-edit-id">
+          <div class="form-group">
+            <label for="lead-name">Nome *</label>
+            <input type="text" id="lead-name" required placeholder="Nome do interessado ou responsável">
+          </div>
+          <div class="form-row">
+            <div class="form-group flex-1">
+              <label for="lead-phone">WhatsApp / Telefone *</label>
+              <input type="tel" id="lead-phone" required placeholder="(47) 99999-9999">
+            </div>
+            <div class="form-group flex-1">
+              <label for="lead-email">E-mail</label>
+              <input type="email" id="lead-email" placeholder="email@exemplo.com">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex-1">
+              <label for="lead-course">Curso de Interesse</label>
+              <input type="text" id="lead-course" placeholder="Ex: Reforço de Matemática">
+            </div>
+            <div class="form-group flex-1">
+              <label for="lead-grade">Série / Objetivo</label>
+              <input type="text" id="lead-grade" placeholder="Ex: 7º ano">
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex-1">
+              <label for="lead-source">Origem</label>
+              <select id="lead-source">
+                <option value="whatsapp">💬 WhatsApp</option>
+                <option value="instagram">📸 Instagram</option>
+                <option value="facebook">👍 Facebook</option>
+                <option value="indicacao">🤝 Indicação</option>
+                <option value="telefone">📞 Telefone</option>
+                <option value="presencial">🏫 Presencial</option>
+                <option value="site">🌐 Site</option>
+                <option value="outro">📌 Outro</option>
+              </select>
+            </div>
+            <div class="form-group flex-1">
+              <label for="lead-status">Etapa</label>
+              <select id="lead-status">
+                <option value="novo">🟡 Novo</option>
+                <option value="contatado">💬 Em Atendimento</option>
+                <option value="agendado">📅 Aula Experimental</option>
+                <option value="matriculado">🎉 Matriculado</option>
+                <option value="arquivado">⚪ Arquivado</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="lead-message">Mensagem / Necessidade</label>
+            <textarea id="lead-message" rows="2" placeholder="O que a pessoa procura"></textarea>
+          </div>
+          <div class="form-group">
+            <label for="lead-notes">Anotações internas</label>
+            <textarea id="lead-notes" rows="2" placeholder="Histórico de contato, retorno combinado..."></textarea>
+          </div>
+          <div class="sheet-actions">
+            <button type="button" class="btn-cancel" id="btn-delete-lead" style="color:#dc2626;">Excluir</button>
+            <button type="button" class="btn-cancel" id="btn-cancel-lead">Cancelar</button>
+            <button type="submit" class="btn-submit" id="btn-save-lead">Salvar Lead</button>
           </div>
         </form>
       </div>
@@ -2270,6 +2394,37 @@
             <div class="form-group flex-1">
               <label for="student-end-date">Data de Término</label>
               <input type="text" id="student-end-date" placeholder="Opcional">
+            </div>
+          </div>
+
+          <div class="form-section-divider">
+            <span>🏠 Dados Pessoais & Colégio</span>
+          </div>
+
+          <div class="form-group">
+            <label for="student-birth-date">Data de Nascimento</label>
+            <input type="date" id="student-birth-date">
+            <small class="text-xs text-muted">Usada para o controle de aniversariantes.</small>
+          </div>
+
+          <div class="form-group">
+            <label for="student-address">Endereço</label>
+            <input type="text" id="student-address" placeholder="Rua, número, bairro, cidade">
+          </div>
+
+          <div class="form-group">
+            <label for="student-school-name">Colégio</label>
+            <input type="text" id="student-school-name" placeholder="Ex: Escola Estadual ...">
+          </div>
+
+          <div class="form-row">
+            <div class="form-group flex-1">
+              <label for="student-school-contact">Responsável no Colégio</label>
+              <input type="text" id="student-school-contact" placeholder="Ex: Coordenadora Ana">
+            </div>
+            <div class="form-group flex-1">
+              <label for="student-school-phone">Telefone do Colégio</label>
+              <input type="tel" id="student-school-phone" placeholder="(47) 3333-3333">
             </div>
           </div>
 
