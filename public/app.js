@@ -635,6 +635,9 @@ function switchView(viewId) {
   if (viewId === 'view-assignments') {
     loadAssignmentsView();
   }
+  if (viewId === 'view-admin-teacher-lessons') {
+    initTeacherLessonsView();
+  }
   if (viewId === 'view-admin-leads') {
     loadAdminLeads();
   }
@@ -1374,6 +1377,7 @@ async function loadTeachers() {
               <small style="color:var(--text-dim); font-size:0.75rem;">⏱️ ${lastClassText}</small>
             </div>
             <div class="btn-card-group">
+              <button class="btn-action-sm btn-view-teacher-lessons" data-id="${t.id}" title="Gerenciar Aulas Dadas">👨‍🏫 Aulas Dadas</button>
               <button class="btn-action-sm btn-edit-teacher" data-id="${t.id}">✏️ Editar</button>
               ${!isSelf ? `
                 <button class="btn-action-sm danger btn-delete-teacher" data-id="${t.id}">
@@ -1385,6 +1389,10 @@ async function loadTeachers() {
         </div>
       `;
     }).join('');
+
+    container.querySelectorAll('.btn-view-teacher-lessons').forEach(b => {
+      b.addEventListener('click', () => openTeacherLessonsView(b.getAttribute('data-id')));
+    });
 
     container.querySelectorAll('.btn-edit-teacher').forEach(b => {
       b.addEventListener('click', () => openTeacherModal(b.getAttribute('data-id')));
@@ -9314,4 +9322,967 @@ function refreshFamilyAlerts() {
   loadTeacherFamilyAlerts();
   const grid = document.getElementById('admin-pendency-grid');
   if (grid && state.activeView === 'view-admin-dashboard') loadAdminDashboard();
+}
+
+
+// ============================================================================
+// GESTÃO DE AULAS POR PROFESSOR (ADMIN)
+// ============================================================================
+
+state.tlTeacherId = null;
+state.tlCurrentDate = new Date();
+state.tlView = 'month'; // 'month' | 'week' | 'day' | 'list'
+state.tlStatusFilter = 'todos'; // 'todos' | 'presente' | 'falta' | 'pendente'
+state.tlLogs = [];
+state.tlSchedules = [];
+state.tlInitialized = false;
+
+function openTeacherLessonsView(teacherId) {
+  if (teacherId) {
+    state.tlTeacherId = String(teacherId);
+  }
+  switchView('view-admin-teacher-lessons');
+}
+
+async function initTeacherLessonsView() {
+  bindTeacherLessonsEvents();
+  await ensureTeacherOptionsLoaded();
+  await loadTeacherLessonsData();
+}
+
+function bindTeacherLessonsEvents() {
+  if (state.tlInitialized) return;
+  state.tlInitialized = true;
+
+  // Seletor de Professor
+  const teacherSel = document.getElementById('select-tl-teacher');
+  if (teacherSel) {
+    teacherSel.addEventListener('change', () => {
+      state.tlTeacherId = teacherSel.value;
+      loadTeacherLessonsData();
+    });
+  }
+
+  // Seletor de Situação / Frequência
+  const statusSel = document.getElementById('select-tl-status');
+  if (statusSel) {
+    statusSel.addEventListener('change', () => {
+      state.tlStatusFilter = statusSel.value;
+      updateTLPeriodAndRender();
+    });
+  }
+
+  // Alternador de Visões: Mês, Semana, Dia, Lista
+  const viewBtns = document.querySelectorAll('.btn-tl-view');
+  viewBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const v = btn.getAttribute('data-view');
+      setTLView(v);
+    });
+  });
+
+  // Navegação de Período
+  const btnToday = document.getElementById('btn-tl-today');
+  if (btnToday) {
+    btnToday.addEventListener('click', () => {
+      state.tlCurrentDate = new Date();
+      updateTLPeriodAndRender();
+    });
+  }
+
+  const btnPrev = document.getElementById('btn-tl-prev');
+  if (btnPrev) {
+    btnPrev.addEventListener('click', () => {
+      navigateTLPeriod(-1);
+    });
+  }
+
+  const btnNext = document.getElementById('btn-tl-next');
+  if (btnNext) {
+    btnNext.addEventListener('click', () => {
+      navigateTLPeriod(1);
+    });
+  }
+
+  // Botões de Ação do Header
+  const btnReport = document.getElementById('btn-tl-generate-report');
+  if (btnReport) {
+    btnReport.addEventListener('click', openTeacherLessonsReportModal);
+  }
+
+  const btnCsv = document.getElementById('btn-tl-export-csv');
+  if (btnCsv) {
+    btnCsv.addEventListener('click', exportTeacherLessonsCSV);
+  }
+
+  const btnPrintReport = document.getElementById('btn-print-teacher-report');
+  if (btnPrintReport) {
+    btnPrintReport.addEventListener('click', () => window.print());
+  }
+
+  const btnCloseReport = document.getElementById('btn-close-teacher-report-modal');
+  if (btnCloseReport) {
+    btnCloseReport.addEventListener('click', () => {
+      const modal = document.getElementById('modal-teacher-lessons-report');
+      if (modal) modal.classList.add('hidden');
+    });
+  }
+}
+
+async function ensureTeacherOptionsLoaded() {
+  const teacherSel = document.getElementById('select-tl-teacher');
+  if (!teacherSel) return;
+
+  if (!state.teachers || state.teachers.length === 0) {
+    try {
+      const res = await fetch(`${API_BASE}/api/teachers`, { headers: getAuthHeaders() });
+      if (res.ok) state.teachers = await res.json();
+    } catch (e) {
+      console.error('Erro ao carregar lista de professores:', e);
+    }
+  }
+
+  const teachers = state.teachers || [];
+  if (teachers.length === 0) {
+    teacherSel.innerHTML = '<option value="">Nenhum professor cadastrado</option>';
+    return;
+  }
+
+  teacherSel.innerHTML = teachers.map(t => {
+    return `<option value="${t.id}">${escapeHtml(t.name)} (${t.email || 'Docente'})</option>`;
+  }).join('');
+
+  if (state.tlTeacherId && teachers.some(t => String(t.id) === String(state.tlTeacherId))) {
+    teacherSel.value = String(state.tlTeacherId);
+  } else {
+    state.tlTeacherId = String(teachers[0].id);
+    teacherSel.value = state.tlTeacherId;
+  }
+}
+
+async function loadTeacherLessonsData() {
+  if (!state.tlTeacherId) return;
+
+  const periodLabel = document.getElementById('tl-period-label');
+  if (periodLabel) periodLabel.textContent = 'Carregando aulas do professor...';
+
+  try {
+    const [resLogs, resSched] = await Promise.all([
+      fetch(`${API_BASE}/api/logs?teacher_id=${state.tlTeacherId}&limit=1000`, { headers: getAuthHeaders() }),
+      fetch(`${API_BASE}/api/schedules?teacher_id=${state.tlTeacherId}`, { headers: getAuthHeaders() })
+    ]);
+
+    if (resLogs.ok) {
+      state.tlLogs = await resLogs.json();
+    } else {
+      state.tlLogs = [];
+    }
+
+    if (resSched.ok) {
+      state.tlSchedules = await resSched.json();
+    } else {
+      state.tlSchedules = [];
+    }
+  } catch (err) {
+    console.error('Erro ao carregar dados de aulas do professor:', err);
+    showToast('Erro ao carregar aulas do professor: ' + err.message, 'error');
+  }
+
+  updateTLPeriodAndRender();
+}
+
+function setTLView(viewMode) {
+  state.tlView = viewMode;
+  document.querySelectorAll('.btn-tl-view').forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-view') === viewMode);
+  });
+
+  document.querySelectorAll('.tl-pane').forEach(p => p.classList.add('hidden'));
+  const targetPane = document.getElementById(`tl-view-${viewMode}`);
+  if (targetPane) targetPane.classList.remove('hidden');
+
+  updateTLPeriodAndRender();
+}
+
+function navigateTLPeriod(direction) {
+  const d = new Date(state.tlCurrentDate);
+  if (state.tlView === 'month' || state.tlView === 'list') {
+    d.setMonth(d.getMonth() + direction);
+  } else if (state.tlView === 'week') {
+    d.setDate(d.getDate() + (direction * 7));
+  } else if (state.tlView === 'day') {
+    d.setDate(d.getDate() + direction);
+  }
+  state.tlCurrentDate = d;
+  updateTLPeriodAndRender();
+}
+
+function updateTLPeriodLabel() {
+  const label = document.getElementById('tl-period-label');
+  if (!label) return;
+
+  const cur = state.tlCurrentDate;
+  const monthNames = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
+  const dayNames = ['Domingo', 'Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado'];
+
+  if (state.tlView === 'month') {
+    label.textContent = `${monthNames[cur.getMonth()]} de ${cur.getFullYear()}`;
+  } else if (state.tlView === 'week') {
+    const startOfWeek = new Date(cur);
+    startOfWeek.setDate(cur.getDate() - cur.getDay());
+    const endOfWeek = new Date(startOfWeek);
+    endOfWeek.setDate(startOfWeek.getDate() + 6);
+
+    const sDay = String(startOfWeek.getDate()).padStart(2, '0');
+    const sMonth = monthNames[startOfWeek.getMonth()].slice(0, 3);
+    const eDay = String(endOfWeek.getDate()).padStart(2, '0');
+    const eMonth = monthNames[endOfWeek.getMonth()].slice(0, 3);
+
+    label.textContent = `Semana: ${sDay} ${sMonth} - ${eDay} ${eMonth} ${endOfWeek.getFullYear()}`;
+  } else if (state.tlView === 'day') {
+    const dNum = String(cur.getDate()).padStart(2, '0');
+    label.textContent = `${dayNames[cur.getDay()]}, ${dNum} de ${monthNames[cur.getMonth()]} de ${cur.getFullYear()}`;
+  } else if (state.tlView === 'list') {
+    label.textContent = `Listagem Geral: ${monthNames[cur.getMonth()]} de ${cur.getFullYear()}`;
+  }
+}
+
+function getTLPeriodRange() {
+  const cur = state.tlCurrentDate;
+  const year = cur.getFullYear();
+  const month = cur.getMonth();
+
+  if (state.tlView === 'month' || state.tlView === 'list') {
+    const startIso = `${year}-${String(month + 1).padStart(2, '0')}-01`;
+    const lastDay = new Date(year, month + 1, 0).getDate();
+    const endIso = `${year}-${String(month + 1).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+    return { startIso, endIso };
+  } else if (state.tlView === 'week') {
+    const startOfWeek = new Date(cur);
+    startOfWeek.setDate(cur.getDate() - cur.getDay());
+    const endOfWeek = new Date(startOfWeek);
+    endOfWeek.setDate(startOfWeek.getDate() + 6);
+    return {
+      startIso: toIsoDateOnly(startOfWeek),
+      endIso: toIsoDateOnly(endOfWeek)
+    };
+  } else {
+    const dIso = toIsoDateOnly(cur);
+    return { startIso: dIso, endIso: dIso };
+  }
+}
+
+/**
+ * Retorna todas as aulas (lançadas e agendadas pendentes) para uma data específica do professor selecionado.
+ */
+function getTLItemsForDate(dateObj) {
+  const dateIso = toIsoDateOnly(dateObj);
+  const items = [];
+
+  // 1. Logs já preenchidos pelo professor nesta data
+  const logsOnDate = (state.tlLogs || []).filter(l => toIsoDateOnly(l.class_date) === dateIso);
+  logsOnDate.forEach(log => {
+    items.push({
+      type: 'log',
+      id: 'log-' + log.id,
+      logId: log.id,
+      time: log.class_time ? log.class_time.slice(0, 5) : '00:00',
+      student_id: log.student_id,
+      student_name: log.student_name || 'Aluno',
+      subject_id: log.subject_id,
+      subject_name: log.subject_name || 'Matéria',
+      classroom_name: log.classroom_name || 'Sala',
+      status: log.status || 'presente',
+      content: log.content || '',
+      incidents: log.incidents || '',
+      pedagogical_notes: log.pedagogical_notes || '',
+      dateIso,
+      rawLog: log
+    });
+  });
+
+  // 2. Horários agendados na grade do professor nesta data
+  const schedsOnDate = (state.tlSchedules || []).filter(s => isScheduleActiveOnDate(s, dateObj));
+  schedsOnDate.forEach(sched => {
+    // Verifica se já existe um log correspondente para o aluno nesta data
+    const hasLog = logsOnDate.some(l => String(l.student_id) === String(sched.student_id));
+    if (!hasLog) {
+      items.push({
+        type: 'pending',
+        id: 'sched-' + sched.id,
+        schedId: sched.id,
+        time: sched.start_time ? sched.start_time.slice(0, 5) : '00:00',
+        endTime: sched.end_time ? sched.end_time.slice(0, 5) : '',
+        student_id: sched.student_id,
+        student_name: sched.student_name || 'Aluno Agendado',
+        subject_id: sched.subject_id,
+        subject_name: sched.subject_name || 'Matéria Agendada',
+        classroom_name: sched.room_or_info || 'Sala',
+        status: 'pendente',
+        content: '',
+        incidents: '',
+        pedagogical_notes: '',
+        dateIso,
+        rawSched: sched
+      });
+    }
+  });
+
+  // Ordena por horário crescente
+  items.sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+
+  // Aplica filtro de status selecionado
+  const filter = state.tlStatusFilter;
+  if (filter === 'todos') {
+    return items;
+  } else if (filter === 'presente') {
+    return items.filter(it => it.status === 'presente');
+  } else if (filter === 'falta') {
+    return items.filter(it => it.status === 'falta');
+  } else if (filter === 'pendente') {
+    return items.filter(it => it.status === 'pendente');
+  }
+  return items;
+}
+
+function updateTLKPIs() {
+  const { startIso, endIso } = getTLPeriodRange();
+  const todayIso = toIsoDateOnly(new Date());
+
+  // Logs no período
+  const logsInPeriod = (state.tlLogs || []).filter(l => {
+    const iso = toIsoDateOnly(l.class_date);
+    return iso >= startIso && iso <= endIso;
+  });
+
+  const totalClasses = logsInPeriod.length;
+  const presenceCount = logsInPeriod.filter(l => l.status === 'presente').length;
+  const absenceCount = logsInPeriod.filter(l => l.status === 'falta').length;
+  const assiduidadeRate = totalClasses > 0 ? Math.round((presenceCount / totalClasses) * 100) + '%' : '0%';
+
+  // Contar pendências até hoje dentro do período selecionado
+  let pendingCount = 0;
+  const startD = new Date(startIso + 'T00:00:00');
+  const endLimit = (endIso < todayIso) ? new Date(endIso + 'T00:00:00') : new Date(todayIso + 'T00:00:00');
+
+  for (let d = new Date(startD); d <= endLimit; d.setDate(d.getDate() + 1)) {
+    const dIso = toIsoDateOnly(d);
+    const logsOnDay = (state.tlLogs || []).filter(l => toIsoDateOnly(l.class_date) === dIso);
+    const schedsOnDay = (state.tlSchedules || []).filter(s => isScheduleActiveOnDate(s, d));
+    schedsOnDay.forEach(sched => {
+      if (!logsOnDay.some(l => String(l.student_id) === String(sched.student_id))) {
+        pendingCount++;
+      }
+    });
+  }
+
+  const kpiTotal = document.getElementById('tl-kpi-total');
+  const kpiPresence = document.getElementById('tl-kpi-presence');
+  const kpiAbsence = document.getElementById('tl-kpi-absence');
+  const kpiRate = document.getElementById('tl-kpi-rate');
+  const kpiPending = document.getElementById('tl-kpi-pending');
+
+  if (kpiTotal) kpiTotal.textContent = totalClasses;
+  if (kpiPresence) kpiPresence.textContent = presenceCount;
+  if (kpiAbsence) kpiAbsence.textContent = absenceCount;
+  if (kpiRate) kpiRate.textContent = assiduidadeRate;
+  if (kpiPending) kpiPending.textContent = pendingCount;
+}
+
+function updateTLPeriodAndRender() {
+  updateTLPeriodLabel();
+  updateTLKPIs();
+  renderTLActiveView();
+}
+
+function renderTLActiveView() {
+  if (state.tlView === 'month') {
+    renderTLMonthView();
+  } else if (state.tlView === 'week') {
+    renderTLWeekView();
+  } else if (state.tlView === 'day') {
+    renderTLDayView();
+  } else if (state.tlView === 'list') {
+    renderTLListView();
+  }
+}
+
+// ----------------------------------------------------------------------------
+// 1. VISÃO MENSAL
+// ----------------------------------------------------------------------------
+function renderTLMonthView() {
+  const grid = document.getElementById('tl-month-grid');
+  if (!grid) return;
+
+  const cur = state.tlCurrentDate;
+  const year = cur.getFullYear();
+  const month = cur.getMonth();
+
+  const firstDayOfMonth = new Date(year, month, 1);
+  const startDayOfWeek = firstDayOfMonth.getDay();
+  const daysInCurrentMonth = new Date(year, month + 1, 0).getDate();
+  const daysInPrevMonth = new Date(year, month, 0).getDate();
+
+  const today = new Date();
+  const isSameMonthAndYear = (today.getFullYear() === year && today.getMonth() === month);
+
+  let html = '';
+
+  // 1. Dias do mês anterior
+  for (let i = startDayOfWeek - 1; i >= 0; i--) {
+    const dayNum = daysInPrevMonth - i;
+    const prevDate = new Date(year, month - 1, dayNum);
+    const items = getTLItemsForDate(prevDate);
+    html += renderTLMonthCell(dayNum, items, prevDate, true, false);
+  }
+
+  // 2. Dias do mês atual
+  for (let dayNum = 1; dayNum <= daysInCurrentMonth; dayNum++) {
+    const thisDate = new Date(year, month, dayNum);
+    const isToday = isSameMonthAndYear && today.getDate() === dayNum;
+    const items = getTLItemsForDate(thisDate);
+    html += renderTLMonthCell(dayNum, items, thisDate, false, isToday);
+  }
+
+  // 3. Dias do mês posterior (completar 35 ou 42 células)
+  const totalRendered = startDayOfWeek + daysInCurrentMonth;
+  const trailingDays = (totalRendered % 7 === 0) ? 0 : (7 - (totalRendered % 7));
+  for (let dayNum = 1; dayNum <= trailingDays; dayNum++) {
+    const nextDate = new Date(year, month + 1, dayNum);
+    const items = getTLItemsForDate(nextDate);
+    html += renderTLMonthCell(dayNum, items, nextDate, true, false);
+  }
+
+  grid.innerHTML = html;
+
+  // Listeners nas pills
+  grid.querySelectorAll('.tl-event-pill').forEach(pill => {
+    pill.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const type = pill.getAttribute('data-item-type');
+      if (type === 'log') {
+        const logId = pill.getAttribute('data-log-id');
+        const log = (state.tlLogs || []).find(l => String(l.id) === String(logId));
+        if (log) {
+          openClassEntryModal(log.student_id, log.subject_id, log.class_date, log.class_time, log);
+        }
+      } else if (type === 'pending') {
+        const schedId = pill.getAttribute('data-sched-id');
+        const dt = pill.getAttribute('data-date');
+        const s = (state.tlSchedules || []).find(item => String(item.id) === String(schedId));
+        if (s) {
+          openClassEntryModal(s.student_id, s.subject_id, dt, s.start_time, null);
+        }
+      }
+    });
+  });
+
+  // Clicar no número do dia navega para o Dia
+  grid.querySelectorAll('.gcal-cell-day-num').forEach(numEl => {
+    numEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const dIso = numEl.getAttribute('data-date');
+      if (dIso) {
+        state.tlCurrentDate = new Date(dIso + 'T00:00:00');
+        setTLView('day');
+      }
+    });
+  });
+}
+
+function renderTLMonthCell(dayNum, items, dateObj, isOtherMonth, isToday) {
+  const dateIso = toIsoDateOnly(dateObj);
+  const cellClasses = ['gcal-month-cell'];
+  if (isOtherMonth) cellClasses.push('other-month');
+  if (isToday) cellClasses.push('is-today');
+
+  const maxDisplay = 4;
+  const visible = items.slice(0, maxDisplay);
+  const overflow = items.length - maxDisplay;
+
+  return `
+    <div class="${cellClasses.join(' ')}">
+      <div class="gcal-cell-header">
+        <span class="gcal-cell-day-num" data-date="${dateIso}">${dayNum}</span>
+        ${items.length > 0 ? `<span style="font-size:0.7rem; color:var(--text-muted); font-weight:700;">${items.length} aula${items.length > 1 ? 's' : ''}</span>` : ''}
+      </div>
+      <div class="gcal-events-stack">
+        ${visible.map(item => {
+          const statusClass = `status-${item.status}`;
+          const icon = item.status === 'presente' ? '✓' : (item.status === 'falta' ? '✕' : '⏳');
+          const studentFirst = item.student_name ? item.student_name.split(' ')[0] : 'Aluno';
+          const titleText = `${item.time} - ${item.student_name} (${item.subject_name}) • Status: ${item.status === 'presente' ? 'Presente' : (item.status === 'falta' ? 'Falta Registrada' : 'Diário Pendente')}`;
+
+          return `
+            <div class="tl-event-pill ${statusClass}" 
+                 data-item-type="${item.type}" 
+                 data-log-id="${item.logId || ''}" 
+                 data-sched-id="${item.schedId || ''}" 
+                 data-date="${dateIso}" 
+                 title="${escapeHtml(titleText)}">
+              <span class="tl-event-status-icon">${icon}</span>
+              <span class="tl-event-time">${item.time}</span>
+              <span class="tl-event-student">${escapeHtml(studentFirst)}</span>
+            </div>
+          `;
+        }).join('')}
+        ${overflow > 0 ? `
+          <button class="gcal-more-btn" data-date="${dateIso}">+${overflow} mais</button>
+        ` : ''}
+      </div>
+    </div>
+  `;
+}
+
+// ----------------------------------------------------------------------------
+// 2. VISÃO SEMANAL
+// ----------------------------------------------------------------------------
+function renderTLWeekView() {
+  const container = document.getElementById('tl-week-container');
+  if (!container) return;
+
+  const cur = state.tlCurrentDate;
+  const startOfWeek = new Date(cur);
+  startOfWeek.setDate(cur.getDate() - cur.getDay());
+
+  const daysOfWeek = [];
+  const dayNames = ['DOM', 'SEG', 'TER', 'QUA', 'QUI', 'SEX', 'SÁB'];
+
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(startOfWeek);
+    d.setDate(startOfWeek.getDate() + i);
+    daysOfWeek.push({
+      dateObj: d,
+      dateIso: toIsoDateOnly(d),
+      name: dayNames[i],
+      num: d.getDate(),
+      items: getTLItemsForDate(d)
+    });
+  }
+
+  const todayIso = toIsoDateOnly(new Date());
+
+  let html = `
+    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px;">
+      ${daysOfWeek.map(d => {
+        const isToday = d.dateIso === todayIso;
+        return `
+          <div style="background:#ffffff; border:1px solid var(--border-color); border-radius:10px; overflow:hidden; display:flex; flex-direction:column; min-height: 380px;">
+            <div style="background:${isToday ? 'var(--brand-blue)' : '#f8fafc'}; color:${isToday ? '#ffffff' : 'var(--text-main)'}; padding:10px; text-align:center; border-bottom:1px solid var(--border-color);">
+              <div style="font-size:0.75rem; font-weight:800; opacity:0.85;">${d.name}</div>
+              <div style="font-size:1.2rem; font-weight:800;">${d.num}</div>
+            </div>
+            <div style="padding:10px; display:flex; flex-direction:column; gap:8px; flex:1; overflow-y:auto;">
+              ${d.items.length === 0 ? `
+                <div style="text-align:center; color:var(--text-muted); font-size:0.8rem; margin:auto; padding:20px 0;">
+                  Sem aulas
+                </div>
+              ` : d.items.map(it => {
+                const isPres = it.status === 'presente';
+                const isFalta = it.status === 'falta';
+                const statusBadge = isPres 
+                  ? '<span class="tl-status-badge presente">✓ Presente</span>'
+                  : (isFalta ? '<span class="tl-status-badge falta">✕ Falta</span>' : '<span class="tl-status-badge pendente">⏳ Pendente</span>');
+
+                return `
+                  <div class="tl-lesson-card status-${it.status}" style="padding:8px 10px; flex-direction:column; align-items:flex-start; gap:6px;">
+                    <div style="display:flex; justify-content:space-between; width:100%; align-items:center;">
+                      <span class="tl-lesson-time-badge" style="font-size:0.78rem; padding:3px 6px;">${it.time}</span>
+                      ${statusBadge}
+                    </div>
+                    <div style="font-size:0.88rem; font-weight:700; color:var(--text-main);">
+                      ${escapeHtml(it.student_name)}
+                    </div>
+                    <div style="font-size:0.75rem; color:var(--text-muted);">
+                      ${escapeHtml(it.subject_name)}
+                    </div>
+                    <button type="button" class="btn-action-sm btn-tl-open-entry" 
+                            data-type="${it.type}" 
+                            data-log-id="${it.logId || ''}" 
+                            data-sched-id="${it.schedId || ''}" 
+                            data-date="${d.dateIso}" 
+                            style="width:100%; margin-top:4px; font-size:0.75rem; padding:4px 6px;">
+                      ${it.type === 'log' ? '✏️ Ver Diário' : '✍️ Lançar Diário'}
+                    </button>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+
+  container.innerHTML = html;
+
+  container.querySelectorAll('.btn-tl-open-entry').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const type = btn.getAttribute('data-type');
+      if (type === 'log') {
+        const logId = btn.getAttribute('data-log-id');
+        const log = (state.tlLogs || []).find(l => String(l.id) === String(logId));
+        if (log) openClassEntryModal(log.student_id, log.subject_id, log.class_date, log.class_time, log);
+      } else {
+        const schedId = btn.getAttribute('data-sched-id');
+        const dt = btn.getAttribute('data-date');
+        const s = (state.tlSchedules || []).find(item => String(item.id) === String(schedId));
+        if (s) openClassEntryModal(s.student_id, s.subject_id, dt, s.start_time, null);
+      }
+    });
+  });
+}
+
+// ----------------------------------------------------------------------------
+// 3. VISÃO DIÁRIA
+// ----------------------------------------------------------------------------
+function renderTLDayView() {
+  const container = document.getElementById('tl-day-container');
+  if (!container) return;
+
+  const cur = state.tlCurrentDate;
+  const items = getTLItemsForDate(cur);
+
+  if (items.length === 0) {
+    container.innerHTML = `
+      <div style="text-align:center; padding: 48px 20px; background:#ffffff; border-radius:12px; border:1px solid var(--border-color);">
+        <span style="font-size:3rem; display:block; margin-bottom:10px;">📅</span>
+        <h4 style="color:var(--text-main); margin-bottom:6px;">Nenhuma aula registrada ou agendada para este dia</h4>
+        <p style="color:var(--text-muted); font-size:0.88rem;">Utilize a navegação de datas para consultar outros dias ou selecione outro professor.</p>
+      </div>
+    `;
+    return;
+  }
+
+  let html = `
+    <div class="tl-day-timeline">
+      ${items.map(it => {
+        const isPres = it.status === 'presente';
+        const isFalta = it.status === 'falta';
+        const statusBadge = isPres 
+          ? '<span class="tl-status-badge presente">✓ Aluno Presente</span>'
+          : (isFalta ? '<span class="tl-status-badge falta">✕ Falta Registrada</span>' : '<span class="tl-status-badge pendente">⏳ Diário Pendente de Lançamento</span>');
+
+        return `
+          <div class="tl-lesson-card status-${it.status}">
+            <div class="tl-lesson-time-badge">${it.time} ${it.endTime ? '- ' + it.endTime : ''}</div>
+            <div class="tl-lesson-info">
+              <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
+                <strong>${escapeHtml(it.student_name)}</strong>
+                ${statusBadge}
+              </div>
+              <div class="tl-lesson-meta">
+                <span>📚 ${escapeHtml(it.subject_name)}</span>
+                <span>🏛️ ${escapeHtml(it.classroom_name)}</span>
+              </div>
+              ${it.content ? `
+                <div class="tl-lesson-content-snippet">
+                  <strong>Conteúdo:</strong> ${escapeHtml(it.content)}
+                </div>
+              ` : ''}
+              ${it.incidents ? `
+                <div style="font-size:0.8rem; color:#b91c1c; margin-top:2px;">
+                  ⚠️ <strong>Intercorrência:</strong> ${escapeHtml(it.incidents)}
+                </div>
+              ` : ''}
+            </div>
+            <div>
+              <button type="button" class="btn-primary-action btn-tl-day-action" 
+                      data-type="${it.type}" 
+                      data-log-id="${it.logId || ''}" 
+                      data-sched-id="${it.schedId || ''}" 
+                      data-date="${it.dateIso}">
+                ${it.type === 'log' ? '✏️ Ver / Editar Diário' : '✍️ Preencher Diário'}
+              </button>
+            </div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+
+  container.innerHTML = html;
+
+  container.querySelectorAll('.btn-tl-day-action').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const type = btn.getAttribute('data-type');
+      if (type === 'log') {
+        const logId = btn.getAttribute('data-log-id');
+        const log = (state.tlLogs || []).find(l => String(l.id) === String(logId));
+        if (log) openClassEntryModal(log.student_id, log.subject_id, log.class_date, log.class_time, log);
+      } else {
+        const schedId = btn.getAttribute('data-sched-id');
+        const dt = btn.getAttribute('data-date');
+        const s = (state.tlSchedules || []).find(item => String(item.id) === String(schedId));
+        if (s) openClassEntryModal(s.student_id, s.subject_id, dt, s.start_time, null);
+      }
+    });
+  });
+}
+
+// ----------------------------------------------------------------------------
+// 4. VISÃO TABELA / LISTA
+// ----------------------------------------------------------------------------
+function renderTLListView() {
+  const tbody = document.getElementById('tl-table-tbody');
+  if (!tbody) return;
+
+  const { startIso, endIso } = getTLPeriodRange();
+  const allPeriodItems = [];
+
+  const startD = new Date(startIso + 'T00:00:00');
+  const endD = new Date(endIso + 'T00:00:00');
+
+  for (let d = new Date(startD); d <= endD; d.setDate(d.getDate() + 1)) {
+    const items = getTLItemsForDate(d);
+    allPeriodItems.push(...items);
+  }
+
+  if (allPeriodItems.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted" style="padding:30px;">Nenhuma aula encontrada para os filtros selecionados no período.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = allPeriodItems.map(it => {
+    const isPres = it.status === 'presente';
+    const isFalta = it.status === 'falta';
+    const statusBadge = isPres 
+      ? '<span class="tl-status-badge presente">✓ Presente</span>'
+      : (isFalta ? '<span class="tl-status-badge falta">✕ Falta</span>' : '<span class="tl-status-badge pendente">⏳ Pendente</span>');
+
+    const dParts = it.dateIso.split('-');
+    const dateFormatted = `${dParts[2]}/${dParts[1]}/${dParts[0]}`;
+
+    return `
+      <tr>
+        <td style="white-space:nowrap;">
+          <strong>${dateFormatted}</strong><br>
+          <small class="text-muted">${it.time}</small>
+        </td>
+        <td><strong>${escapeHtml(it.student_name)}</strong></td>
+        <td>${escapeHtml(it.subject_name)}</td>
+        <td>${statusBadge}</td>
+        <td style="max-width:280px;">${it.content ? escapeHtml(it.content) : '<span class="text-muted text-xs">Sem conteúdo</span>'}</td>
+        <td style="max-width:220px;">${it.incidents ? `<span style="color:#b91c1c;">${escapeHtml(it.incidents)}</span>` : (it.pedagogical_notes ? escapeHtml(it.pedagogical_notes) : '<span class="text-muted text-xs">-</span>')}</td>
+        <td>
+          <button type="button" class="btn-action-sm btn-tl-list-action" 
+                  data-type="${it.type}" 
+                  data-log-id="${it.logId || ''}" 
+                  data-sched-id="${it.schedId || ''}" 
+                  data-date="${it.dateIso}">
+            ${it.type === 'log' ? '✏️ Diário' : '✍️ Lançar'}
+          </button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+
+  tbody.querySelectorAll('.btn-tl-list-action').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const type = btn.getAttribute('data-type');
+      if (type === 'log') {
+        const logId = btn.getAttribute('data-log-id');
+        const log = (state.tlLogs || []).find(l => String(l.id) === String(logId));
+        if (log) openClassEntryModal(log.student_id, log.subject_id, log.class_date, log.class_time, log);
+      } else {
+        const schedId = btn.getAttribute('data-sched-id');
+        const dt = btn.getAttribute('data-date');
+        const s = (state.tlSchedules || []).find(item => String(item.id) === String(schedId));
+        if (s) openClassEntryModal(s.student_id, s.subject_id, dt, s.start_time, null);
+      }
+    });
+  });
+}
+
+// ----------------------------------------------------------------------------
+// 5. RELATÓRIO DE AULAS MINISTRADAS POR PROFESSOR
+// ----------------------------------------------------------------------------
+function openTeacherLessonsReportModal() {
+  const modal = document.getElementById('modal-teacher-lessons-report');
+  const printArea = document.getElementById('teacher-report-printable-area');
+  const metaLabel = document.getElementById('report-docente-meta');
+  if (!modal || !printArea) return;
+
+  const teacher = (state.teachers || []).find(t => String(t.id) === String(state.tlTeacherId)) || { name: 'Professor', email: '' };
+  const { startIso, endIso } = getTLPeriodRange();
+
+  // Coleta as aulas dadas pelo professor no período
+  const logsInPeriod = (state.tlLogs || []).filter(l => {
+    const iso = toIsoDateOnly(l.class_date);
+    return iso >= startIso && iso <= endIso;
+  }).sort((a, b) => {
+    const cmp = (a.class_date || '').localeCompare(b.class_date || '');
+    if (cmp !== 0) return cmp;
+    return (a.class_time || '').localeCompare(b.class_time || '');
+  });
+
+  const totalClasses = logsInPeriod.length;
+  const presenceCount = logsInPeriod.filter(l => l.status === 'presente').length;
+  const absenceCount = logsInPeriod.filter(l => l.status === 'falta').length;
+  const assiduidadeRate = totalClasses > 0 ? Math.round((presenceCount / totalClasses) * 100) + '%' : '0%';
+
+  const monthNames = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
+  const cur = state.tlCurrentDate;
+  const periodText = state.tlView === 'month' || state.tlView === 'list'
+    ? `Mês de ${monthNames[cur.getMonth()]} de ${cur.getFullYear()}`
+    : `Período de ${formatDateBR(startIso)} a ${formatDateBR(endIso)}`;
+
+  if (metaLabel) metaLabel.textContent = `${teacher.name} • ${periodText}`;
+
+  const nowBR = new Date().toLocaleString('pt-BR');
+
+  let reportHtml = `
+    <div class="tr-header">
+      <div class="tr-brand">
+        <h2>Entrelinhas Reforço Escolar</h2>
+        <span>Comprovante e Relatório de Aulas Ministradas</span>
+      </div>
+      <div class="tr-meta-doc">
+        <div><strong>Emissão:</strong> ${nowBR}</div>
+        <div><strong>Controle Administrativo</strong></div>
+      </div>
+    </div>
+
+    <div style="background:#f1f5f9; padding:12px 16px; border-radius:8px; margin-bottom:16px; display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px;">
+      <div>
+        <div style="font-size:0.75rem; font-weight:700; color:#64748b; text-transform:uppercase;">Docente Responsável</div>
+        <div style="font-size:1.1rem; font-weight:800; color:var(--brand-blue);">${escapeHtml(teacher.name)}</div>
+        <div style="font-size:0.8rem; color:#475569;">${escapeHtml(teacher.email || 'Sem e-mail')}</div>
+      </div>
+      <div>
+        <div style="font-size:0.75rem; font-weight:700; color:#64748b; text-transform:uppercase;">Período Analisado</div>
+        <div style="font-size:1.05rem; font-weight:800; color:#0f172a;">${periodText}</div>
+      </div>
+    </div>
+
+    <!-- Indicadores -->
+    <div class="tr-summary-grid">
+      <div class="tr-summary-item">
+        <span>Total de Aulas</span>
+        <strong>${totalClasses}</strong>
+      </div>
+      <div class="tr-summary-item">
+        <span>Presenças</span>
+        <strong style="color:#15803d;">${presenceCount}</strong>
+      </div>
+      <div class="tr-summary-item">
+        <span>Ausências / Faltas</span>
+        <strong style="color:#b91c1c;">${absenceCount}</strong>
+      </div>
+      <div class="tr-summary-item">
+        <span>Assiduidade</span>
+        <strong style="color:#0284c7;">${assiduidadeRate}</strong>
+      </div>
+    </div>
+
+    <!-- Tabela de Aulas Ministradas -->
+    <h4 style="margin: 0 0 10px 0; color:var(--brand-blue); font-size:1rem;">Detalhamento das Aulas Registradas no Diário:</h4>
+    <table class="tr-table">
+      <thead>
+        <tr>
+          <th style="width:110px;">Data & Hora</th>
+          <th>Aluno</th>
+          <th>Matéria</th>
+          <th style="width:90px;">Frequência</th>
+          <th>Conteúdo Ministrado</th>
+          <th>Observações</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${logsInPeriod.length === 0 ? `
+          <tr><td colspan="6" style="text-align:center; padding:20px; color:#64748b;">Nenhuma aula registrada pelo professor neste período.</td></tr>
+        ` : logsInPeriod.map(l => `
+          <tr>
+            <td>
+              <strong>${formatDateBR(l.class_date)}</strong><br>
+              <small style="color:#64748b;">${l.class_time ? l.class_time.slice(0, 5) : '-'}</small>
+            </td>
+            <td><strong>${escapeHtml(l.student_name || 'Aluno')}</strong></td>
+            <td>${escapeHtml(l.subject_name || '-')}</td>
+            <td>
+              ${l.status === 'presente' 
+                ? '<span style="color:#15803d; font-weight:800;">✓ Presente</span>' 
+                : '<span style="color:#b91c1c; font-weight:800;">✕ Falta</span>'}
+            </td>
+            <td>${l.content ? escapeHtml(l.content) : '<span style="color:#94a3b8; font-style:italic;">Não informado</span>'}</td>
+            <td>${l.incidents ? `<span style="color:#b91c1c;">${escapeHtml(l.incidents)}</span>` : (l.pedagogical_notes ? escapeHtml(l.pedagogical_notes) : '-')}</td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+
+    <!-- Assinaturas -->
+    <div class="tr-signatures">
+      <div class="tr-signature-line">
+        <div class="line"></div>
+        <span>${escapeHtml(teacher.name)}</span><br>
+        <small style="color:#64748b;">Docente</small>
+      </div>
+      <div class="tr-signature-line">
+        <div class="line"></div>
+        <span>Coordenação Pedagógica</span><br>
+        <small style="color:#64748b;">Colégio e Curso Entrelinhas</small>
+      </div>
+    </div>
+  `;
+
+  printArea.innerHTML = reportHtml;
+  modal.classList.remove('hidden');
+}
+
+// ----------------------------------------------------------------------------
+// 6. EXPORTAÇÃO CSV
+// ----------------------------------------------------------------------------
+function exportTeacherLessonsCSV() {
+  const teacher = (state.teachers || []).find(t => String(t.id) === String(state.tlTeacherId)) || { name: 'Professor' };
+  const { startIso, endIso } = getTLPeriodRange();
+
+  const logsInPeriod = (state.tlLogs || []).filter(l => {
+    const iso = toIsoDateOnly(l.class_date);
+    return iso >= startIso && iso <= endIso;
+  }).sort((a, b) => {
+    const cmp = (a.class_date || '').localeCompare(b.class_date || '');
+    if (cmp !== 0) return cmp;
+    return (a.class_time || '').localeCompare(b.class_time || '');
+  });
+
+  if (logsInPeriod.length === 0) {
+    showToast('Nenhuma aula registrada para exportar neste período.', 'info');
+    return;
+  }
+
+  const csvRows = [];
+  // Cabeçalho CSV
+  csvRows.push(['Data', 'Horario', 'Professor', 'Aluno', 'Materia', 'Frequencia', 'Conteudo_Ministrado', 'Intercorrencias_Observacoes'].join(';'));
+
+  logsInPeriod.forEach(l => {
+    const sanitize = (text) => {
+      if (!text) return '';
+      return '"' + String(text).replace(/"/g, '""').replace(/\r?\n/g, ' ') + '"';
+    };
+
+    csvRows.push([
+      formatDateBR(l.class_date),
+      l.class_time ? l.class_time.slice(0, 5) : '',
+      sanitize(teacher.name),
+      sanitize(l.student_name || ''),
+      sanitize(l.subject_name || ''),
+      l.status === 'presente' ? 'Presente' : 'Falta',
+      sanitize(l.content || ''),
+      sanitize(l.incidents || l.pedagogical_notes || '')
+    ].join(';'));
+  });
+
+  const csvContent = '\uFEFF' + csvRows.join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const profNameSanitized = teacher.name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+  a.download = `relatorio_aulas_${profNameSanitized}_${startIso}_a_${endIso}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  showToast('Relatório CSV exportado com sucesso!', 'success');
 }

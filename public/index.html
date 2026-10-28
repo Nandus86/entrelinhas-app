@@ -668,6 +668,10 @@
               <span class="tab-icon">📖</span>
               <span class="tab-label">Diário</span>
             </button>
+            <button class="nav-tab" data-view="view-admin-teacher-lessons">
+              <span class="tab-icon">👨‍🏫</span>
+              <span class="tab-label">Aulas Docentes</span>
+            </button>
             <button class="nav-tab" data-view="view-admin-finance">
               <span class="tab-icon">💰</span>
               <span class="tab-label">Financeiro</span>
@@ -880,6 +884,13 @@
                 <div>
                   <strong>Relatórios</strong>
                   <small>Histórico dia a dia</small>
+                </div>
+              </button>
+              <button class="shortcut-btn" onclick="switchView('view-admin-teacher-lessons')">
+                <span class="shortcut-icon">👨‍🏫</span>
+                <div>
+                  <strong>Aulas por Professor</strong>
+                  <small>Grade e diários preenchidos</small>
                 </div>
               </button>
             </div>
@@ -1968,6 +1979,150 @@
           </div>
         </section>
 
+      
+        <!-- ======================================================== -->
+        <!-- VIEW: GESTÃO DE AULAS POR PROFESSOR (ADMIN) -->
+        <!-- ======================================================== -->
+        <section id="view-admin-teacher-lessons" class="view-panel">
+          <div class="gcal-main-header">
+            <div class="gcal-header-left">
+              <div class="gcal-title-row">
+                <h2>👨‍🏫 Aulas Dadas por Professor</h2>
+                <span class="role-pill-badge admin-accent">Controle Docente</span>
+              </div>
+              <span class="panel-subtitle">Acompanhe as aulas preenchidas pelo professor, presenças e ausências dos alunos, e gere relatórios de aulas ministradas.</span>
+            </div>
+
+            <div class="gcal-header-right">
+              <button type="button" id="btn-tl-generate-report" class="btn-primary-action">
+                <span>📄 Relatório de Aulas</span>
+              </button>
+              <button type="button" id="btn-tl-export-csv" class="btn-secondary-action">
+                <span>📥 Exportar CSV</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Filtros de Professor e Frequência -->
+          <div class="tl-controls-bar">
+            <div class="tl-filters-left">
+              <div class="tl-field-box">
+                <label for="select-tl-teacher">👨‍🏫 Professor Responsável:</label>
+                <select id="select-tl-teacher" class="tl-select" aria-label="Filtrar por professor">
+                  <option value="">Carregando professores...</option>
+                </select>
+              </div>
+
+              <div class="tl-field-box">
+                <label for="select-tl-status">🎯 Situação da Frequência:</label>
+                <select id="select-tl-status" class="tl-select" aria-label="Filtrar por status da aula">
+                  <option value="todos">Todas as Aulas Lançadas</option>
+                  <option value="presente">✅ Aluno Presente</option>
+                  <option value="falta">❌ Aluno Ausente / Falta</option>
+                  <option value="pendente">⏳ Diários Pendentes na Grade</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Alternador de Visões: Mês, Semana, Dia, Lista -->
+            <div class="gcal-view-selector" role="group" aria-label="Modo de visualização">
+              <button type="button" class="btn-tl-view active" data-view="month" id="btn-tlv-month">Mês</button>
+              <button type="button" class="btn-tl-view" data-view="week" id="btn-tlv-week">Semana</button>
+              <button type="button" class="btn-tl-view" data-view="day" id="btn-tlv-day">Dia</button>
+              <button type="button" class="btn-tl-view" data-view="list" id="btn-tlv-list">Lista</button>
+            </div>
+          </div>
+
+          <!-- Cards de Indicadores do Período -->
+          <div class="tl-kpis-grid">
+            <div class="tl-kpi-card total">
+              <span class="tl-kpi-num" id="tl-kpi-total">0</span>
+              <span class="tl-kpi-label">Aulas Ministradas</span>
+            </div>
+            <div class="tl-kpi-card presence">
+              <span class="tl-kpi-num" id="tl-kpi-presence">0</span>
+              <span class="tl-kpi-label">Alunos Presentes</span>
+            </div>
+            <div class="tl-kpi-card absence">
+              <span class="tl-kpi-num" id="tl-kpi-absence">0</span>
+              <span class="tl-kpi-label">Faltas / Ausências</span>
+            </div>
+            <div class="tl-kpi-card rate">
+              <span class="tl-kpi-num" id="tl-kpi-rate">0%</span>
+              <span class="tl-kpi-label">Taxa de Assiduidade</span>
+            </div>
+            <div class="tl-kpi-card pending">
+              <span class="tl-kpi-num" id="tl-kpi-pending">0</span>
+              <span class="tl-kpi-label">Aulas Pendentes</span>
+            </div>
+          </div>
+
+          <!-- Navegação de Data estilo Google Calendar -->
+          <div class="gcal-toolbar">
+            <div class="gcal-nav-group">
+              <button id="btn-tl-today" class="btn-gcal-nav-today">Hoje</button>
+              <div class="gcal-nav-arrows">
+                <button id="btn-tl-prev" class="btn-gcal-arrow" title="Anterior">‹</button>
+                <button id="btn-tl-next" class="btn-gcal-arrow" title="Próximo">›</button>
+              </div>
+              <h3 id="tl-period-label" class="gcal-current-label">Carregando período...</h3>
+            </div>
+
+            <div class="tl-help-hint">
+              <span>💡 Clique em uma aula para ver o conteúdo ou editar o diário</span>
+            </div>
+          </div>
+
+          <!-- Viewports do Calendário Docente -->
+          <div class="gcal-viewport-container">
+            <!-- 1. Mês -->
+            <div id="tl-view-month" class="tl-pane active">
+              <div class="gcal-month-header-days">
+                <div class="gcal-day-name">DOM</div>
+                <div class="gcal-day-name">SEG</div>
+                <div class="gcal-day-name">TER</div>
+                <div class="gcal-day-name">QUA</div>
+                <div class="gcal-day-name">QUI</div>
+                <div class="gcal-day-name">SEX</div>
+                <div class="gcal-day-name">SÁB</div>
+              </div>
+              <div id="tl-month-grid" class="gcal-month-grid"></div>
+            </div>
+
+            <!-- 2. Semana -->
+            <div id="tl-view-week" class="tl-pane hidden">
+              <div id="tl-week-container" class="gcal-week-container"></div>
+            </div>
+
+            <!-- 3. Dia -->
+            <div id="tl-view-day" class="tl-pane hidden">
+              <div id="tl-day-container" class="gcal-day-container"></div>
+            </div>
+
+            <!-- 4. Lista / Tabela Detalhada -->
+            <div id="tl-view-list" class="tl-pane hidden">
+              <div class="data-table-wrap">
+                <table class="data-table" id="tl-table-list">
+                  <thead>
+                    <tr>
+                      <th>Data & Hora</th>
+                      <th>Aluno</th>
+                      <th>Matéria</th>
+                      <th>Frequência</th>
+                      <th>Conteúdo Ministrado</th>
+                      <th>Intercorrências / Obs</th>
+                      <th>Ações</th>
+                    </tr>
+                  </thead>
+                  <tbody id="tl-table-tbody">
+                    <tr><td colspan="7" class="text-center text-muted">Carregando registros...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
       </main>
 
       <!-- Bottom Navigation Bar: Administrador -->
@@ -1987,6 +2142,10 @@
         <button class="nav-tab" data-view="view-history">
           <span class="tab-icon">📖</span>
           <span class="tab-label">Diário</span>
+        </button>
+        <button class="nav-tab" data-view="view-admin-teacher-lessons">
+          <span class="tab-icon">👨‍🏫</span>
+          <span class="tab-label">Aulas</span>
         </button>
         <button class="nav-tab" data-view="view-admin-finance">
           <span class="tab-icon">💰</span>
@@ -3508,5 +3667,33 @@
 
   <script src="qrcode.bundle.js"></script>
   <script src="app.js"></script>
-</body>
+
+    <!-- ======================================================== -->
+    <!-- MODAL: RELATÓRIO DE AULAS MINISTRADAS POR PROFESSOR -->
+    <!-- ======================================================== -->
+    <div id="modal-teacher-lessons-report" role="dialog" aria-modal="true" class="modal-backdrop hidden">
+      <div class="bottom-sheet sheet-large modal-report-docente">
+        <div class="sheet-drag-handle"></div>
+        <div class="sheet-header">
+          <div>
+            <h2>Relatório de Aulas Dadas</h2>
+            <span class="sheet-subtitle" id="report-docente-meta">Professor e Período</span>
+          </div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <button type="button" id="btn-print-teacher-report" class="btn-primary-action" style="padding: 6px 14px; font-size: 0.82rem;">
+              <span>🖨️ Imprimir / PDF</span>
+            </button>
+            <button id="btn-close-teacher-report-modal" class="btn-close" aria-label="Fechar">✕</button>
+          </div>
+        </div>
+
+        <div class="sheet-body" style="padding: 16px 20px;">
+          <div id="teacher-report-printable-area" class="teacher-report-print-area">
+            <!-- Injetado dinamicamente via JS -->
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </body>
 </html>
