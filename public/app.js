@@ -1417,10 +1417,11 @@ function openTeacherModal(teacherId = null) {
   form.reset();
 
   const cbContainer = document.getElementById('teacher-subjects-checkboxes');
-  cbContainer.innerHTML = state.subjects.map(s => `
-    <label style="display:flex; align-items:center; gap:8px; font-size:0.85rem; margin-bottom:6px;">
+  cbContainer.innerHTML = (state.subjects || []).map(s => `
+    <label class="subject-choice-card">
       <input type="checkbox" name="teacher_sub" value="${s.id}">
-      <span>${s.name}</span>
+      <span class="subject-choice-check" aria-hidden="true"></span>
+      <span class="subject-choice-name">${escapeHtml(s.name)}</span>
     </label>
   `).join('');
 
@@ -1764,9 +1765,10 @@ async function openStudentModalAdmin(studentId = null) {
 
   const cbContainer = document.getElementById('student-subjects-checkboxes');
   cbContainer.innerHTML = (state.subjects || []).map(s => `
-    <label style="display:flex; align-items:center; gap:8px; font-size:0.85rem; margin-bottom:6px;">
+    <label class="subject-choice-card">
       <input type="checkbox" name="admin_student_sub" value="${s.id}">
-      <span>${s.name}</span>
+      <span class="subject-choice-check" aria-hidden="true"></span>
+      <span class="subject-choice-name">${escapeHtml(s.name)}</span>
     </label>
   `).join('');
 
