@@ -2568,22 +2568,113 @@ function updateEntryResourcesChips(classroomId, preselected = []) {
 }
 
 // ==========================================
+// MOTOR DE BUSCA DO HORÁRIO AGENDADO DA AULA
+// ==========================================
+function findScheduledClassTime(student, subjectId, dateStr) {
+  if (!student) return null;
+
+  let dayOfWeek = null;
+  if (dateStr) {
+    const parts = String(dateStr).split('-');
+    if (parts.length === 3) {
+      const d = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10), 12, 0, 0);
+      dayOfWeek = d.getDay();
+    }
+  }
+
+  const enrollments = Array.isArray(student.enrollments) ? student.enrollments : [];
+  const stateSchedules = Array.isArray(state.schedules)
+    ? state.schedules.filter(s => String(s.student_id) === String(student.id) && s.status !== 'inativo')
+    : [];
+
+  const allSchedules = [...enrollments, ...stateSchedules];
+  const currentTeacherId = state.currentUser && state.currentUser.role === 'professor' ? String(state.currentUser.id) : null;
+  const currentSubId = subjectId ? String(subjectId) : null;
+
+  const formatTime = (t) => {
+    if (!t) return null;
+    const str = String(t).trim();
+    if (!str) return null;
+    return str.substring(0, 5);
+  };
+
+  // 1. Mesmo professor, mesma matéria e mesmo dia da semana
+  if (dayOfWeek !== null) {
+    const matchPerfect = allSchedules.find(s => {
+      const matchTeach = !currentTeacherId || String(s.teacher_id) === currentTeacherId;
+      const matchSub = !currentSubId || String(s.subject_id) === currentSubId;
+      const matchDay = Number(s.day_of_week) === dayOfWeek;
+      return matchTeach && matchSub && matchDay && s.start_time;
+    });
+    if (matchPerfect) return formatTime(matchPerfect.start_time);
+
+    // 2. Mesma matéria e mesmo dia da semana
+    const matchSubDay = allSchedules.find(s => {
+      const matchSub = !currentSubId || String(s.subject_id) === currentSubId;
+      const matchDay = Number(s.day_of_week) === dayOfWeek;
+      return matchSub && matchDay && s.start_time;
+    });
+    if (matchSubDay) return formatTime(matchSubDay.start_time);
+
+    // 3. Mesmo professor e mesmo dia da semana (outra matéria)
+    const matchDayTeacher = allSchedules.find(s => {
+      const matchTeach = !currentTeacherId || String(s.teacher_id) === currentTeacherId;
+      const matchDay = Number(s.day_of_week) === dayOfWeek;
+      return matchTeach && matchDay && s.start_time;
+    });
+    if (matchDayTeacher) return formatTime(matchDayTeacher.start_time);
+
+    // 4. Qualquer aula do aluno no mesmo dia da semana
+    const matchDayOnly = allSchedules.find(s => Number(s.day_of_week) === dayOfWeek && s.start_time);
+    if (matchDayOnly) return formatTime(matchDayOnly.start_time);
+  }
+
+  // 5. Mesma matéria e mesmo professor (em outro dia)
+  const matchSubTeacher = allSchedules.find(s => {
+    const matchTeach = !currentTeacherId || String(s.teacher_id) === currentTeacherId;
+    const matchSub = !currentSubId || String(s.subject_id) === currentSubId;
+    return matchTeach && matchSub && s.start_time;
+  });
+  if (matchSubTeacher) return formatTime(matchSubTeacher.start_time);
+
+  // 6. Mesma matéria (qualquer professor)
+  const matchSub = allSchedules.find(s => (!currentSubId || String(s.subject_id) === currentSubId) && s.start_time);
+  if (matchSub) return formatTime(matchSub.start_time);
+
+  // 7. Qualquer aula com este professor
+  const matchAnyTeacher = allSchedules.find(s => (!currentTeacherId || String(s.teacher_id) === currentTeacherId) && s.start_time);
+  if (matchAnyTeacher) return formatTime(matchAnyTeacher.start_time);
+
+  // 8. Qualquer aula cadastrada do aluno
+  const matchAny = allSchedules.find(s => s.start_time);
+  if (matchAny) return formatTime(matchAny.start_time);
+
+  return null;
+}
+
+// ==========================================
 // MODAL DE LANÇAMENTO DE AULA
 // ==========================================
 async function openClassEntryModal(studentId, defaultSubjectId = null, defaultDate = null, defaultTime = null, editLog = null) {
   let student = (state.students || []).find(s => String(s.id) === String(studentId)) || (state.adminStudents || []).find(s => String(s.id) === String(studentId));
-  if (!student) {
+  if (!student || !student.enrollments || student.enrollments.length === 0) {
     try {
       const res = await fetch(`${API_BASE}/api/students/${studentId}`, { headers: getAuthHeaders() });
       if (res.ok) {
         const stData = await res.json();
-        student = stData.student || stData;
+        const fullStudent = stData.student || stData;
+        if (fullStudent) {
+          student = { ...(student || {}), ...fullStudent };
+        }
       }
     } catch (e) {
       console.warn('Could not fetch student directly:', e);
     }
   }
   if (!student) return;
+
+  state.currentModalStudent = student;
+  state.currentModalEditLog = editLog;
 
   const editIdInput = document.getElementById('entry-log-edit-id');
   if (editIdInput) editIdInput.value = editLog ? editLog.id : '';
@@ -2688,9 +2779,16 @@ async function openClassEntryModal(studentId, defaultSubjectId = null, defaultDa
     document.getElementById('entry-incidents').value = editLog.incidents || 'Sem intercorrências';
     document.getElementById('entry-pedagogical').value = editLog.pedagogical_notes || '';
   } else {
-    document.getElementById('entry-date').value = defaultDate || spNow.dateIso;
+    const targetDate = defaultDate || spNow.dateIso;
+    document.getElementById('entry-date').value = targetDate;
     if (timeInput) {
-      timeInput.value = defaultTime || spNow.timeStr;
+      let resolvedTime = null;
+      if (defaultTime) {
+        resolvedTime = String(defaultTime).trim().substring(0, 5);
+      } else {
+        resolvedTime = findScheduledClassTime(student, select.value, targetDate);
+      }
+      timeInput.value = resolvedTime || spNow.timeStr;
     }
     if (state.currentUser) {
       document.getElementById('entry-teacher').value = state.currentUser.name;
@@ -2998,6 +3096,43 @@ function setupEventListeners() {
   document.getElementById('btn-close-history-modal').addEventListener('click', closeStudentHistoryModal);
 
   // Submissão de aula
+  // Atualizar horário e recursos dinamicamente ao trocar de matéria ou data
+  const entrySubSelect = document.getElementById('entry-subject-id');
+  if (entrySubSelect) {
+    entrySubSelect.addEventListener('change', () => {
+      const entryClassroomSelect = document.getElementById('entry-classroom-id');
+      if (entryClassroomSelect) {
+        const selectedSub = (state.subjects || []).find(s => String(s.id) === String(entrySubSelect.value));
+        const targetClassroomId = selectedSub ? selectedSub.classroom_id : (state.classrooms.length > 0 ? state.classrooms[0].id : null);
+        if (targetClassroomId) entryClassroomSelect.value = targetClassroomId;
+        const preselectedResources = selectedSub && selectedSub.required_resources ? selectedSub.required_resources : [];
+        updateEntryResourcesChips(entryClassroomSelect.value, preselectedResources);
+      }
+      if (!state.currentModalEditLog && state.currentModalStudent) {
+        const dateInput = document.getElementById('entry-date');
+        const timeInput = document.getElementById('entry-time');
+        const scheduledTime = findScheduledClassTime(state.currentModalStudent, entrySubSelect.value, dateInput ? dateInput.value : '');
+        if (scheduledTime && timeInput) {
+          timeInput.value = scheduledTime;
+        }
+      }
+    });
+  }
+
+  const entryDateInput = document.getElementById('entry-date');
+  if (entryDateInput) {
+    entryDateInput.addEventListener('change', () => {
+      if (!state.currentModalEditLog && state.currentModalStudent) {
+        const subSelect = document.getElementById('entry-subject-id');
+        const timeInput = document.getElementById('entry-time');
+        const scheduledTime = findScheduledClassTime(state.currentModalStudent, subSelect ? subSelect.value : '', entryDateInput.value);
+        if (scheduledTime && timeInput) {
+          timeInput.value = scheduledTime;
+        }
+      }
+    });
+  }
+
   document.getElementById('form-class-entry').addEventListener('submit', async (e) => {
     e.preventDefault();
     const btnSubmit = document.getElementById('btn-save-entry');
@@ -3432,7 +3567,7 @@ function setupEventListeners() {
         const ev = state.selectedEventForDetail.event;
         const dt = state.selectedEventForDetail.dateStr;
         closeEventDetailModal();
-        openClassEntryModal(ev.student_id, ev.subject_id, dt);
+        openClassEntryModal(ev.student_id, ev.subject_id, dt, ev.start_time);
       }
     });
   }
@@ -4101,7 +4236,7 @@ function renderDayView() {
       const schedId = btn.getAttribute('data-sched-id');
       const dt = btn.getAttribute('data-date');
       const s = state.schedules.find(item => String(item.id) === String(schedId));
-      if (s) openClassEntryModal(s.student_id, s.subject_id, dt);
+      if (s) openClassEntryModal(s.student_id, s.subject_id, dt, s.start_time);
     });
   });
 
