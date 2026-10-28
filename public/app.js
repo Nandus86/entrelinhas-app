@@ -3189,6 +3189,11 @@ function setupEventListeners() {
       if (state.activeView === 'view-teacher-today') {
         loadTeacherTodayClasses();
       }
+      loadScheduleLogs().then(() => {
+        if (state.activeView === 'view-schedules') {
+          renderGoogleCalendar();
+        }
+      });
       if (state.activeView === 'view-admin-dashboard') {
         loadAdminDashboardData();
       }
@@ -3566,8 +3571,9 @@ function setupEventListeners() {
       if (state.selectedEventForDetail) {
         const ev = state.selectedEventForDetail.event;
         const dt = state.selectedEventForDetail.dateStr;
+        const log = getScheduleEventLog(ev, dt);
         closeEventDetailModal();
-        openClassEntryModal(ev.student_id, ev.subject_id, dt, ev.start_time);
+        openClassEntryModal(ev.student_id, ev.subject_id, dt, ev.start_time, log);
       }
     });
   }
@@ -3666,11 +3672,30 @@ function setupEventListeners() {
 // MOTOR DA GRADE DE HORÁRIOS ESTILO GOOGLE CALENDAR
 // =========================================================
 
+async function loadScheduleLogs() {
+  try {
+    const res = await fetch(`${API_BASE}/api/logs?limit=1000`, { headers: getAuthHeaders() });
+    if (res.ok) {
+      state.scheduleLogs = await res.json();
+    }
+  } catch (e) {
+    console.warn('Erro ao carregar logs da grade:', e);
+  }
+}
+
 async function loadSchedules() {
   try {
-    const res = await fetch(`${API_BASE}/api/schedules`, { headers: getAuthHeaders() });
-    if (!res.ok) throw new Error('Erro ao carregar grade de horários');
-    state.schedules = await res.json();
+    const [schedRes, logsRes] = await Promise.all([
+      fetch(`${API_BASE}/api/schedules`, { headers: getAuthHeaders() }),
+      fetch(`${API_BASE}/api/logs?limit=1000`, { headers: getAuthHeaders() }).catch(() => null)
+    ]);
+    if (!schedRes.ok) throw new Error('Erro ao carregar grade de horários');
+    state.schedules = await schedRes.json();
+    if (logsRes && logsRes.ok) {
+      state.scheduleLogs = await logsRes.json();
+    } else {
+      state.scheduleLogs = state.scheduleLogs || [];
+    }
 
     populateCalendarFilters();
     renderGoogleCalendar();
@@ -3921,6 +3946,21 @@ function getFilteredSchedulesForDate(dateObj) {
   return list.filter(s => isScheduleActiveOnDate(s, dateObj)).sort((a, b) => (a.start_time || '').localeCompare(b.start_time || ''));
 }
 
+function getScheduleEventLog(sched, dateIso) {
+  if (!sched || !dateIso || !state.scheduleLogs || !Array.isArray(state.scheduleLogs)) return null;
+  const targetIso = toIsoDateOnly(dateIso);
+  const studentId = sched.student_id ? String(sched.student_id) : null;
+  const subjectId = sched.subject_id ? String(sched.subject_id) : null;
+
+  return state.scheduleLogs.find(l => {
+    const logIso = toIsoDateOnly(l.class_date);
+    if (logIso !== targetIso) return false;
+    if (studentId && String(l.student_id) !== studentId) return false;
+    if (subjectId && l.subject_id && String(l.subject_id) !== subjectId) return false;
+    return true;
+  }) || null;
+}
+
 function getEventColorTheme(sched) {
   const code = (sched.subject_code || sched.subject_name || '').toLowerCase();
   if (code.includes('port') || code.includes('redac')) return 'event-theme-orange';
@@ -4021,11 +4061,15 @@ function renderMonthCell(dayNum, events, dateObj, isOtherMonth, isToday) {
           const theme = getEventColorTheme(s);
           const studentDisplay = s.student_name ? s.student_name.split(' ')[0] : (s.teacher_name || 'Aula');
           const freqLabel = s.resolved_frequency === 'quinzenal' ? '15d' : (s.resolved_frequency === 'custom_dias' ? `${s.resolved_interval_days}d` : '');
+          const log = getScheduleEventLog(s, dateIso);
+          const isLogged = Boolean(log);
+          const logTitle = isLogged ? ` • [✅ Diário Lançado: ${log.status === 'falta' ? 'Falta' : 'Presente'}]` : '';
           return `
-            <div class="gcal-event-pill ${theme}" data-sched-id="${s.id}" data-date="${dateIso}" title="${s.start_time} - ${s.subject_name || 'Aula'} (${s.teacher_name})">
+            <div class="gcal-event-pill ${theme} ${isLogged ? 'is-logged' : ''}" data-sched-id="${s.id}" data-date="${dateIso}" title="${s.start_time} - ${s.subject_name || 'Aula'} (${s.teacher_name})${logTitle}">
+              ${isLogged ? '<span class="gcal-logged-icon" title="Diário Lançado">✓</span>' : ''}
               <span class="gcal-event-time">${s.start_time}</span>
               <span class="gcal-event-text">${studentDisplay}</span>
-              ${freqLabel ? `<span class="gcal-event-freq-badge">${freqLabel}</span>` : ''}
+              ${isLogged ? '<span class="gcal-pill-logged-badge" title="Diário Lançado">Lançada</span>' : (freqLabel ? `<span class="gcal-event-freq-badge">${freqLabel}</span>` : '')}
             </div>
           `;
         }).join('')}
@@ -4106,10 +4150,15 @@ function renderWeekView() {
                     <div class="gcal-week-slot">
                       ${hourEvents.map(s => {
                         const theme = getEventColorTheme(s);
+                        const log = getScheduleEventLog(s, d.iso);
+                        const isLogged = Boolean(log);
                         return `
-                          <div class="gcal-week-card ${theme}" data-sched-id="${s.id}" data-date="${d.iso}">
-                            <div style="font-weight: 800; font-size: 0.72rem; color: var(--brand-blue);">
-                              🕒 ${s.start_time} - ${s.end_time}
+                          <div class="gcal-week-card ${theme} ${isLogged ? 'is-logged' : ''}" data-sched-id="${s.id}" data-date="${d.iso}">
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
+                              <div style="font-weight: 800; font-size: 0.72rem; color: var(--brand-blue);">
+                                🕒 ${s.start_time} - ${s.end_time}
+                              </div>
+                              ${isLogged ? `<span class="gcal-week-logged-badge" title="Diário registrado (${log.status === 'falta' ? 'Falta' : 'Presente'})">✅ Lançada</span>` : ''}
                             </div>
                             <div style="font-weight: 700; color: var(--text-main);">
                               ${s.subject_name || 'Aula Geral'}
@@ -4196,13 +4245,26 @@ function renderDayView() {
             const freqLabel = s.resolved_frequency === 'quinzenal' 
               ? '🌓 Quinzenal' 
               : (s.resolved_frequency === 'custom_dias' ? `⚙️ A cada ${s.resolved_interval_days} dias` : '📅 Semanal');
+            const log = getScheduleEventLog(s, dateIso);
+            const isLogged = Boolean(log);
 
             return `
-              <div class="gcal-day-card" data-sched-id="${s.id}" data-date="${dateIso}">
+              <div class="gcal-day-card ${isLogged ? 'is-logged' : ''}" data-sched-id="${s.id}" data-date="${dateIso}">
                 <div class="gcal-day-card-left">
-                  <span class="gcal-day-card-icon">📖</span>
+                  <span class="gcal-day-card-icon">${isLogged ? '✅' : '📖'}</span>
                   <div>
-                    <div class="gcal-day-card-subject">${s.subject_name || 'Matéria Geral'}</div>
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                      <span class="gcal-day-card-subject">${s.subject_name || 'Matéria Geral'}</span>
+                      ${isLogged ? `
+                        <span class="badge-class-logged">
+                          ✅ Diário Lançado (${log.status === 'falta' ? 'Falta' : 'Presente'})
+                        </span>
+                      ` : `
+                        <span class="badge-class-pending">
+                          ⏳ Diário Pendente
+                        </span>
+                      `}
+                    </div>
                     <div class="gcal-day-card-meta">
                       <span>🕒 <strong>${s.start_time} - ${s.end_time}</strong></span>
                       <span>👨‍🏫 Prof. ${s.teacher_name}</span>
@@ -4213,8 +4275,8 @@ function renderDayView() {
                 </div>
 
                 <div class="gcal-day-card-right">
-                  <button type="button" class="btn-card-action primary btn-quick-log-card" data-sched-id="${s.id}" data-date="${dateIso}">
-                    <span>✍️ Diário</span>
+                  <button type="button" class="btn-card-action ${isLogged ? 'secondary' : 'primary'} btn-quick-log-card" data-sched-id="${s.id}" data-date="${dateIso}">
+                    <span>${isLogged ? '✏️ Ver / Editar Diário' : '✍️ Registrar Diário'}</span>
                   </button>
                   <button type="button" class="btn-card-action secondary btn-quick-detail-card" data-sched-id="${s.id}" data-date="${dateIso}">
                     <span>👁️ Detalhes</span>
@@ -4236,7 +4298,10 @@ function renderDayView() {
       const schedId = btn.getAttribute('data-sched-id');
       const dt = btn.getAttribute('data-date');
       const s = state.schedules.find(item => String(item.id) === String(schedId));
-      if (s) openClassEntryModal(s.student_id, s.subject_id, dt, s.start_time);
+      if (s) {
+        const log = getScheduleEventLog(s, dt);
+        openClassEntryModal(s.student_id, s.subject_id, dt, s.start_time, log);
+      }
     });
   });
 
@@ -4406,6 +4471,35 @@ function openEventDetailModal(schedItem, dateStr) {
   if (notesEl) {
     notesEl.textContent = schedItem.notes || 'Nenhuma observação cadastrada para este horário.';
   }
+  const log = getScheduleEventLog(schedItem, dateStr);
+  const statusBanner = document.getElementById('event-detail-status-banner');
+  if (statusBanner) {
+    if (log) {
+      statusBanner.className = 'event-detail-status-banner is-logged';
+      statusBanner.innerHTML = `
+        <span class="banner-icon">✅</span>
+        <div class="banner-texts">
+          <strong>Diário de Aula Lançado</strong>
+          <span>Frequência: <strong>${log.status === 'falta' ? '❌ Falta Registrada' : '✅ Aluno Presente'}</strong>${log.content ? ' • Conteúdo: ' + escapeHtml(log.content) : ''}</span>
+        </div>
+      `;
+    } else {
+      statusBanner.className = 'event-detail-status-banner is-pending';
+      statusBanner.innerHTML = `
+        <span class="banner-icon">⏳</span>
+        <div class="banner-texts">
+          <strong>Diário Pendente</strong>
+          <span>Esta aula ainda não possui registro de presença ou conteúdo lançado nesta data.</span>
+        </div>
+      `;
+    }
+  }
+
+  const btnEventQuickLog = document.getElementById('btn-event-quick-log');
+  if (btnEventQuickLog) {
+    btnEventQuickLog.innerHTML = log ? '<span>✏️ Ver / Editar Diário Desta Aula</span>' : '<span>✍️ Registrar Diário Desta Aula</span>';
+  }
+
 
   modal.classList.remove('hidden');
 }
