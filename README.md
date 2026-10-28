@@ -19,13 +19,6 @@ O sistema roda em Docker (`docker compose up -d`):
 
 Em 07/10/2026 os dados de demonstração foram apagados para o início dos testes com dados reais. A equipe, as matérias, as salas, os alunos, os cursos e os planos são cadastrados pelo admin. O backup de antes da limpeza está em `backups/`.
 
---- | :--- | :--- | :--- |
-| 👑 Administrador | `admin@entrelinhas.com` | `admin123` | Acesso total |
-| 👨‍🏫 Prof. Luciano | `luciano@entrelinhas.com` | `prof123` | Português, Port. Concurso e Redação |
-| 👩‍🏫 Profa. Sibele | `sibele@entrelinhas.com` | `prof123` | Matemática Reforço |
-| 👨‍🏫 Prof. Fernando | `fernando@entrelinhas.com` | `prof123` | Informática e Matemática |
-| 👨‍👩‍👧 Família | Código `PAIS-ANA`, `PAIS-DAVI`, `PAIS-NYCOLAS` | — | Só o próprio aluno |
-
 ---
 
 ## 🧭 Regras de negócio aplicadas pelo sistema
@@ -35,10 +28,16 @@ Em 07/10/2026 os dados de demonstração foram apagados para o início dos teste
 - **Família** vê apenas o próprio aluno (aulas, agenda, horários, faturas e tarefas). O login é feito somente pelo código de acesso cadastrado.
 - **Admin** vê e gerencia tudo.
 
-### Professor responsável e matrícula
-- Cada aluno tem um professor **responsável**. Se o aluno tem aulas na grade, o responsável é sempre um dos professores dessas aulas (o sistema recalcula automaticamente ao mudar a grade).
-- Aluno ativo sem professor fica com matrícula **"aguardando professor"** e aparece nas pendências do painel.
-- Na edição do aluno: trocar o professor transfere os horários do antigo para o novo (validando conflitos); deixar o campo vazio desvincula e tira os horários dele da grade.
+### Matrícula por matéria
+- No cadastro do aluno, cada matéria marcada abre uma **aba de matrícula**. É obrigatório marcar ao menos uma matéria, e toda matéria marcada precisa ter ao menos um horário preenchido.
+- Cada horário tem **professor** (obrigatório, só quem leciona a matéria), periodicidade, dias da semana, horário, duração, início e observação. A mesma matéria pode ter **vários horários** e **professores diferentes**.
+- Cada horário vira uma linha da grade por dia da semana, passando pelas validações da Grade. Se algum horário falhar, nada é gravado, e o erro indica a matéria (a aba dela é aberta).
+- Na edição, os horários que continuam iguais (mesma matéria, professor, dia e início) são atualizados no mesmo registro. Os que saíram do formulário deixam a grade; desmarcar uma matéria que já tem horários pede confirmação.
+- Aluno inativo não tem grade: as abas só são exigidas quando ele está ativo.
+
+### Professor responsável
+- O **responsável** é calculado automaticamente entre os professores das aulas do aluno (fica o atual, se ainda der aula; senão, o que tem mais aulas com o aluno).
+- Aluno ativo sem nenhuma aula na grade fica com matrícula **"aguardando professor"** e aparece nas pendências do painel.
 - Inativar um professor tira os horários dele da grade e recalcula os alunos afetados.
 
 ### Grade de horários

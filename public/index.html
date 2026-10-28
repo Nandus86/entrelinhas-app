@@ -2451,73 +2451,25 @@
             </div>
           </div>
 
+          <!-- Seção de Matrícula por Matéria: uma aba para cada matéria marcada -->
+          <div class="form-section-divider">
+            <span>📅 Matrícula & Frequência por Matéria</span>
+          </div>
+
           <div class="form-group">
-            <label>Matérias Matriculadas *</label>
+            <label>Matérias Matriculadas * <small class="text-xs text-muted">(mínimo 1)</small></label>
             <div id="student-subjects-checkboxes" class="checkbox-group">
               <!-- Injetado dinamicamente -->
             </div>
           </div>
 
-          <!-- Seção de Matrícula, Frequência e Professor -->
-          <div class="form-section-divider">
-            <span>📅 Matrícula & Frequência das Aulas</span>
-          </div>
-
-          <div class="form-row">
-            <div class="form-group flex-1">
-              <label for="student-frequency-type">Periodicidade das Aulas *</label>
-              <select id="student-frequency-type">
-                <option value="semanal" selected>📅 Semanal (Toda semana)</option>
-                <option value="quinzenal">🌓 Quinzenal (A cada 15 dias)</option>
-                <option value="custom_dias">⚙️ Intervalo Personalizado (A cada X dias)</option>
-              </select>
-            </div>
-            <div class="form-group flex-1 hidden" id="group-student-custom-days">
-              <label for="student-custom-days">A cada quantos dias? *</label>
-              <input type="number" id="student-custom-days" min="1" max="60" value="3" placeholder="Ex: 3 ou 4">
-            </div>
+          <div id="enr-box" class="enr-box">
+            <div id="enr-tabs" class="enr-tabs" role="tablist" aria-label="Matrículas por matéria"></div>
+            <div id="enr-panel" class="enr-panel" role="tabpanel"></div>
           </div>
 
           <div class="form-group">
-            <label>Dias da Semana Sugeridos / Preferidos</label>
-            <div class="weekday-selector-chips" id="student-preferred-days-group">
-              <label class="weekday-chip"><input type="checkbox" name="pref_day" value="1"> <span>Seg</span></label>
-              <label class="weekday-chip"><input type="checkbox" name="pref_day" value="2"> <span>Ter</span></label>
-              <label class="weekday-chip"><input type="checkbox" name="pref_day" value="3"> <span>Qua</span></label>
-              <label class="weekday-chip"><input type="checkbox" name="pref_day" value="4"> <span>Qui</span></label>
-              <label class="weekday-chip"><input type="checkbox" name="pref_day" value="5"> <span>Sex</span></label>
-              <label class="weekday-chip"><input type="checkbox" name="pref_day" value="6"> <span>Sáb</span></label>
-              <label class="weekday-chip"><input type="checkbox" name="pref_day" value="0"> <span>Dom</span></label>
-            </div>
-          </div>
-
-          <div class="form-row">
-            <div class="form-group flex-1">
-              <label for="student-preferred-time">Horário Preferencial</label>
-              <input type="time" id="student-preferred-time" value="08:00">
-            </div>
-            <div class="form-group flex-1">
-              <label for="student-duration-minutes">Duração da Aula</label>
-              <select id="student-duration-minutes">
-                <option value="45">45 minutos</option>
-                <option value="60" selected>60 minutos (1 hora)</option>
-                <option value="90">90 minutos (1h 30m)</option>
-                <option value="120">120 minutos (2 horas)</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="form-group">
-            <label for="student-assigned-teacher">Professor Designado (Amarração)</label>
-            <select id="student-assigned-teacher">
-              <option value="" selected>⏳ Sem Professor (Aguardando na Fila / Pendente)</option>
-              <!-- Preenchido dinamicamente com professores ativos -->
-            </select>
-            <small class="text-xs text-muted">Ao selecionar o professor, o sistema amarra o professor com o aluno e já integra na Grade de Horários!</small>
-          </div>
-
-          <div class="form-group">
-            <label for="student-enrollment-notes">Observações da Matrícula</label>
+            <label for="student-enrollment-notes">Observações gerais da matrícula</label>
             <input type="text" id="student-enrollment-notes" placeholder="Ex: Precisa de reforço para concurso, horários flexíveis…">
           </div>
 

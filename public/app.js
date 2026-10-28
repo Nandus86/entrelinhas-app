@@ -1644,6 +1644,8 @@ async function loadAdminStudents() {
             ${subjectsBadges}
           </div>
 
+          ${enrollmentSummaryHtml(st)}
+
           <div class="student-card-info-box">
             <div class="student-stat-pill">
               <span>Presenças: <strong>${st.total_presences || 0}</strong></span>
@@ -1768,25 +1770,6 @@ async function openStudentModalAdmin(studentId = null) {
     </label>
   `).join('');
 
-  // Popula select de professores no modal de aluno
-  const teacherSelect = document.getElementById('student-assigned-teacher');
-  if (teacherSelect) {
-    teacherSelect.innerHTML = '<option value="">⏳ Sem Professor (Aguardando na Fila / Pendente)</option>' + assignableTeacherOptions();
-  }
-
-  // Listener para mostrar/esconder campo de dias personalizados
-  const freqSelect = document.getElementById('student-frequency-type');
-  const customDaysGroup = document.getElementById('group-student-custom-days');
-  if (freqSelect && customDaysGroup) {
-    freqSelect.onchange = () => {
-      if (freqSelect.value === 'custom_dias') {
-        customDaysGroup.classList.remove('hidden');
-      } else {
-        customDaysGroup.classList.add('hidden');
-      }
-    };
-  }
-
   if (studentId) {
     const student = state.adminStudents.find(s => String(s.id) === String(studentId)) || state.students.find(s => String(s.id) === String(studentId));
     if (!student) return;
@@ -1804,31 +1787,6 @@ async function openStudentModalAdmin(studentId = null) {
     document.getElementById('student-school-contact').value = student.school_contact_name || '';
     document.getElementById('student-school-phone').value = student.school_phone || '';
 
-    // Frequência e Matrícula
-    if (freqSelect) {
-      freqSelect.value = student.frequency_type || 'semanal';
-      if (freqSelect.value === 'custom_dias') {
-        customDaysGroup.classList.remove('hidden');
-        document.getElementById('student-custom-days').value = student.custom_interval_days || 3;
-      } else {
-        customDaysGroup.classList.add('hidden');
-      }
-    }
-
-    const prefDays = String(student.preferred_days || '').split(',').map(d => d.trim());
-    document.querySelectorAll('#student-preferred-days-group input[name="pref_day"]').forEach(chk => {
-      chk.checked = prefDays.includes(chk.value);
-    });
-
-    if (document.getElementById('student-preferred-time')) {
-      document.getElementById('student-preferred-time').value = student.preferred_time || '08:00';
-    }
-    if (document.getElementById('student-duration-minutes')) {
-      document.getElementById('student-duration-minutes').value = student.duration_minutes || 60;
-    }
-    if (teacherSelect) {
-      teacherSelect.value = student.assigned_teacher_id || '';
-    }
     if (document.getElementById('student-enrollment-notes')) {
       document.getElementById('student-enrollment-notes').value = student.enrollment_notes || '';
     }
@@ -1847,26 +1805,324 @@ async function openStudentModalAdmin(studentId = null) {
     document.querySelectorAll('input[name="admin_student_sub"]').forEach(cb => {
       if (subIds.includes(parseInt(cb.value))) cb.checked = true;
     });
+    initEnrollmentTabs(student);
   } else {
     title.textContent = 'Cadastrar Novo Aluno';
     document.getElementById('student-edit-id').value = '';
     const parentCodeEl = document.getElementById('student-parent-code');
     if (parentCodeEl) parentCodeEl.value = 'PAIS-' + Math.floor(1000 + Math.random() * 9000);
-
-    if (freqSelect) {
-      freqSelect.value = 'semanal';
-      customDaysGroup.classList.add('hidden');
-    }
-    document.querySelectorAll('#student-preferred-days-group input[name="pref_day"]').forEach(chk => {
-      chk.checked = (chk.value === '1'); // Segunda como default
-    });
-    if (document.getElementById('student-preferred-time')) document.getElementById('student-preferred-time').value = '08:00';
-    if (document.getElementById('student-duration-minutes')) document.getElementById('student-duration-minutes').value = '60';
-    if (teacherSelect) teacherSelect.value = '';
     if (document.getElementById('student-enrollment-notes')) document.getElementById('student-enrollment-notes').value = '';
+    initEnrollmentTabs(null);
   }
 
   modal.classList.remove('hidden');
+}
+
+// ==========================================
+// MATRÍCULA POR MATÉRIA (abas no cadastro do aluno)
+// Cada matéria marcada abre uma aba com um ou mais horários; cada horário tem professor,
+// periodicidade, dias, horário, duração, início e observação. O servidor transforma cada
+// horário em linhas da grade (uma por dia da semana).
+// ==========================================
+const ENR_DAYS = [[1, 'Seg'], [2, 'Ter'], [3, 'Qua'], [4, 'Qui'], [5, 'Sex'], [6, 'Sáb'], [0, 'Dom']];
+const ENR_DURATIONS = [30, 45, 60, 90, 120];
+const enr = { slots: {}, active: null, saved: new Set() };
+
+function enrMinutes(t) {
+  const [h, m] = String(t || '').split(':').map(Number);
+  return h * 60 + m;
+}
+
+function enrEndTime(start, duration) {
+  const total = enrMinutes(start) + (parseInt(duration) || 0);
+  if (!start || Number.isNaN(total) || total >= 24 * 60) return '';
+  return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+}
+
+function enrTeachersFor(subjectId) {
+  return (state.teachers || []).filter(t => t.role === 'professor' && t.status === 'ativo' &&
+    (t.subjects || []).some(s => String(s.id) === String(subjectId)));
+}
+
+function enrNewSlot(subjectId) {
+  const teachers = enrTeachersFor(subjectId);
+  return {
+    teacher_id: teachers.length === 1 ? String(teachers[0].id) : '',
+    frequency_type: 'semanal', recurrence_interval_days: 3,
+    days: [], start_time: '08:00', duration_minutes: 60,
+    start_date: toIsoDateOnly(new Date()), notes: ''
+  };
+}
+
+function enrSlotComplete(s) {
+  return !!(s.teacher_id && s.days.length && /^\d{2}:\d{2}$/.test(s.start_time) &&
+    enrEndTime(s.start_time, s.duration_minutes) &&
+    (s.frequency_type !== 'custom_dias' || parseInt(s.recurrence_interval_days) >= 1));
+}
+
+// Resumo das matrículas no cartão do aluno: "Matemática · Fernando · Seg, Qua 14:00–15:00"
+function enrollmentSummaryHtml(student) {
+  const list = student.enrollments || [];
+  if (list.length === 0) {
+    return (student.status || 'ativo') === 'ativo'
+      ? '<div class="enr-summary"><span class="enr-summary-empty">Sem horários na grade</span></div>'
+      : '';
+  }
+  const dayLabel = Object.fromEntries(ENR_DAYS);
+  const groups = new Map();
+  list.forEach(e => {
+    const key = [e.subject_id, e.teacher_id, e.start_time, e.end_time, e.frequency_type].join('|');
+    if (!groups.has(key)) groups.set(key, { ...e, days: [] });
+    groups.get(key).days.push(e.day_of_week);
+  });
+  const freqLabel = { quinzenal: ' · quinzenal', custom_dias: ' · a cada N dias' };
+  return `<ul class="enr-summary">${[...groups.values()].map(g => {
+    const days = ENR_DAYS.map(([d]) => d).filter(d => g.days.includes(d)).map(d => dayLabel[d]).join(', ');
+    return `<li><strong>${escapeHtml(g.subject_name || 'Sem matéria')}</strong> · ${escapeHtml((g.teacher_name || '').split(' ')[0])} · ${days} ${g.start_time}–${g.end_time}${freqLabel[g.frequency_type] || ''}</li>`;
+  }).join('')}</ul>`;
+}
+
+function enrCheckedSubjects() {
+  return Array.from(document.querySelectorAll('input[name="admin_student_sub"]:checked')).map(cb => cb.value);
+}
+
+// Agrupa as linhas da grade do aluno em horários do formulário (mesma matéria, professor, faixa e periodicidade)
+function initEnrollmentTabs(student) {
+  enr.slots = {};
+  enr.saved = new Set();
+  const groups = new Map();
+  ((student && student.enrollments) || []).forEach(e => {
+    if (!e.subject_id) return;
+    const key = [e.subject_id, e.teacher_id, e.start_time, e.end_time, e.frequency_type, e.recurrence_interval_days, e.notes || ''].join('|');
+    if (!groups.has(key)) {
+      const autoNote = /^(Matrícula:|Aula regular - Aluno)/.test(e.notes || '');
+      groups.set(key, {
+        subject_id: String(e.subject_id),
+        teacher_id: String(e.teacher_id),
+        frequency_type: e.frequency_type || 'semanal',
+        recurrence_interval_days: e.recurrence_interval_days || 3,
+        days: [], start_time: e.start_time,
+        duration_minutes: enrMinutes(e.end_time) - enrMinutes(e.start_time),
+        start_date: e.start_date || '', notes: autoNote ? '' : (e.notes || '')
+      });
+    }
+    const g = groups.get(key);
+    if (!g.days.includes(e.day_of_week)) g.days.push(e.day_of_week);
+    if (e.start_date && (!g.start_date || e.start_date < g.start_date)) g.start_date = e.start_date;
+  });
+  groups.forEach(g => {
+    const { subject_id, ...slot } = g;
+    (enr.slots[subject_id] = enr.slots[subject_id] || []).push(slot);
+    enr.saved.add(subject_id);
+  });
+
+  const checked = enrCheckedSubjects();
+  checked.forEach(id => { if (!enr.slots[id]) enr.slots[id] = [enrNewSlot(id)]; });
+  enr.active = checked[0] || null;
+
+  document.querySelectorAll('input[name="admin_student_sub"]').forEach(cb => {
+    cb.addEventListener('change', () => onEnrollmentSubjectToggle(cb));
+  });
+  renderEnrollmentTabs();
+}
+
+function onEnrollmentSubjectToggle(cb) {
+  const id = cb.value;
+  if (cb.checked) {
+    if (!enr.slots[id] || enr.slots[id].length === 0) enr.slots[id] = [enrNewSlot(id)];
+    enr.active = id;
+    renderEnrollmentTabs();
+    return;
+  }
+  const finish = () => {
+    if (enr.active === id) enr.active = enrCheckedSubjects()[0] || null;
+    renderEnrollmentTabs();
+  };
+  if (enr.saved.has(id)) {
+    // Desmarcar uma matéria que já está na grade tira os horários dela ao salvar
+    cb.checked = true;
+    const name = (state.subjects.find(s => String(s.id) === id) || {}).name || 'esta matéria';
+    showAppConfirm(`Ao salvar, os horários de ${name} deste aluno saem da grade. Deseja remover a matéria?`, () => {
+      cb.checked = false;
+      finish();
+    }, 'Remover Matéria', true);
+    return;
+  }
+  finish();
+}
+
+function renderEnrollmentTabs() {
+  const tabsEl = document.getElementById('enr-tabs');
+  const panelEl = document.getElementById('enr-panel');
+  if (!tabsEl || !panelEl) return;
+  const checked = enrCheckedSubjects();
+
+  if (checked.length === 0) {
+    tabsEl.innerHTML = '';
+    panelEl.innerHTML = '<p class="enr-empty">Marque ao menos uma matéria acima. Cada matéria abre uma aba para definir professor, dias e horário das aulas.</p>';
+    return;
+  }
+  if (!checked.includes(enr.active)) enr.active = checked[0];
+
+  tabsEl.innerHTML = checked.map(id => {
+    const name = (state.subjects.find(s => String(s.id) === id) || {}).name || 'Matéria';
+    const ok = (enr.slots[id] || []).length > 0 && enr.slots[id].every(enrSlotComplete);
+    return `<button type="button" role="tab" class="enr-tab ${id === enr.active ? 'active' : ''}" data-sub="${id}" aria-selected="${id === enr.active}">
+      <span class="enr-tab-name">${escapeHtml(name)}</span>
+      <span class="enr-tab-status ${ok ? 'ok' : 'pending'}" data-status-for="${id}" aria-label="${ok ? 'completa' : 'falta preencher'}">${ok ? '✓' : '!'}</span>
+    </button>`;
+  }).join('');
+
+  const subId = enr.active;
+  const teachers = enrTeachersFor(subId);
+  const slots = enr.slots[subId] || [];
+  panelEl.innerHTML = `
+    ${teachers.length === 0 ? `<p class="enr-warning">Nenhum professor ativo leciona esta matéria. Vincule a matéria a um professor em Gestão &gt; Professores.</p>` : ''}
+    ${slots.map((s, i) => `
+      <div class="enr-slot" data-index="${i}">
+        <div class="enr-slot-head">
+          <strong>Horário ${i + 1}</strong>
+          ${slots.length > 1 ? `<button type="button" class="enr-slot-remove" data-action="remove" data-index="${i}" aria-label="Remover horário ${i + 1}">Remover</button>` : ''}
+        </div>
+        <div class="form-group">
+          <label>Professor *</label>
+          <select data-field="teacher_id" data-index="${i}">
+            <option value="">Selecione o professor</option>
+            ${teachers.map(t => `<option value="${t.id}" ${String(t.id) === String(s.teacher_id) ? 'selected' : ''}>${escapeHtml(t.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row">
+          <div class="form-group flex-1">
+            <label>Periodicidade *</label>
+            <select data-field="frequency_type" data-index="${i}">
+              <option value="semanal" ${s.frequency_type === 'semanal' ? 'selected' : ''}>Semanal (toda semana)</option>
+              <option value="quinzenal" ${s.frequency_type === 'quinzenal' ? 'selected' : ''}>Quinzenal (semana sim, semana não)</option>
+              <option value="custom_dias" ${s.frequency_type === 'custom_dias' ? 'selected' : ''}>A cada X dias</option>
+            </select>
+          </div>
+          <div class="form-group flex-1 ${s.frequency_type === 'custom_dias' ? '' : 'hidden'}" data-custom-for="${i}">
+            <label>A cada quantos dias? *</label>
+            <input type="number" min="1" max="60" data-field="recurrence_interval_days" data-index="${i}" value="${s.recurrence_interval_days || 3}">
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Dias da semana *</label>
+          <div class="weekday-selector-chips">
+            ${ENR_DAYS.map(([d, label]) => `<label class="weekday-chip"><input type="checkbox" data-field="days" data-index="${i}" value="${d}" ${s.days.includes(d) ? 'checked' : ''}> <span>${label}</span></label>`).join('')}
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group flex-1">
+            <label>Horário *</label>
+            <input type="time" data-field="start_time" data-index="${i}" value="${s.start_time || ''}">
+          </div>
+          <div class="form-group flex-1">
+            <label>Duração *</label>
+            <select data-field="duration_minutes" data-index="${i}">
+              ${[...new Set([...ENR_DURATIONS, parseInt(s.duration_minutes) || 60])].sort((a, b) => a - b)
+                .map(m => `<option value="${m}" ${m === parseInt(s.duration_minutes) ? 'selected' : ''}>${m} min</option>`).join('')}
+            </select>
+            <small class="text-xs text-muted" data-end-for="${i}">${enrEndTime(s.start_time, s.duration_minutes) ? 'Termina às ' + enrEndTime(s.start_time, s.duration_minutes) : 'Passa da meia-noite'}</small>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group flex-1">
+            <label>Início das aulas</label>
+            <input type="date" data-field="start_date" data-index="${i}" value="${s.start_date || ''}">
+          </div>
+          <div class="form-group flex-1">
+            <label>Observação</label>
+            <input type="text" data-field="notes" data-index="${i}" value="${escapeHtml(s.notes || '')}" placeholder="Ex: foco em frações">
+          </div>
+        </div>
+      </div>
+    `).join('')}
+    <button type="button" class="enr-add" data-action="add">+ Adicionar outro horário nesta matéria</button>
+  `;
+}
+
+function refreshEnrollmentStatus(subId) {
+  const el = document.querySelector(`#enr-tabs [data-status-for="${subId}"]`);
+  if (!el) return;
+  const ok = (enr.slots[subId] || []).length > 0 && enr.slots[subId].every(enrSlotComplete);
+  el.className = `enr-tab-status ${ok ? 'ok' : 'pending'}`;
+  el.textContent = ok ? '✓' : '!';
+  el.setAttribute('aria-label', ok ? 'completa' : 'falta preencher');
+}
+
+function setupEnrollmentTabs() {
+  const tabsEl = document.getElementById('enr-tabs');
+  const panelEl = document.getElementById('enr-panel');
+  if (!tabsEl || !panelEl) return;
+
+  tabsEl.addEventListener('click', e => {
+    const tab = e.target.closest('.enr-tab');
+    if (!tab) return;
+    enr.active = tab.dataset.sub;
+    renderEnrollmentTabs();
+  });
+
+  panelEl.addEventListener('click', e => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const slots = enr.slots[enr.active] || [];
+    if (btn.dataset.action === 'add') slots.push(enrNewSlot(enr.active));
+    if (btn.dataset.action === 'remove') slots.splice(parseInt(btn.dataset.index), 1);
+    enr.slots[enr.active] = slots;
+    renderEnrollmentTabs();
+  });
+
+  const onField = e => {
+    const el = e.target;
+    const field = el.dataset.field;
+    if (!field) return;
+    const i = parseInt(el.dataset.index);
+    const slot = (enr.slots[enr.active] || [])[i];
+    if (!slot) return;
+    if (field === 'days') {
+      const d = parseInt(el.value);
+      slot.days = el.checked ? [...new Set([...slot.days, d])] : slot.days.filter(x => x !== d);
+    } else {
+      slot[field] = el.value;
+    }
+    if (field === 'frequency_type') {
+      panelEl.querySelector(`[data-custom-for="${i}"]`).classList.toggle('hidden', el.value !== 'custom_dias');
+    }
+    if (field === 'start_time' || field === 'duration_minutes') {
+      const end = enrEndTime(slot.start_time, slot.duration_minutes);
+      panelEl.querySelector(`[data-end-for="${i}"]`).textContent = end ? 'Termina às ' + end : 'Passa da meia-noite';
+    }
+    refreshEnrollmentStatus(enr.active);
+  };
+  panelEl.addEventListener('input', onField);
+  panelEl.addEventListener('change', onField);
+}
+
+// Monta os horários para o envio. Retorna { enrollments } ou { error, subjectId }.
+function collectEnrollments() {
+  const checked = enrCheckedSubjects();
+  if (checked.length === 0) return { error: 'Selecione ao menos uma matéria e preencha a matrícula dela.' };
+  const enrollments = [];
+  for (const id of checked) {
+    const slots = enr.slots[id] || [];
+    const name = (state.subjects.find(s => String(s.id) === id) || {}).name || 'matéria';
+    const bad = slots.findIndex(s => !enrSlotComplete(s));
+    if (slots.length === 0 || bad >= 0) {
+      return { error: `Complete a matrícula de ${name}${bad >= 0 && slots.length > 1 ? ` (horário ${bad + 1})` : ''}: professor, dias da semana, horário e duração são obrigatórios.`, subjectId: id };
+    }
+    slots.forEach(s => enrollments.push({
+      subject_id: parseInt(id),
+      teacher_id: parseInt(s.teacher_id),
+      frequency_type: s.frequency_type,
+      recurrence_interval_days: parseInt(s.recurrence_interval_days) || null,
+      days: s.days,
+      start_time: s.start_time,
+      duration_minutes: parseInt(s.duration_minutes),
+      start_date: s.start_date || null,
+      notes: s.notes || ''
+    }));
+  }
+  return { enrollments };
 }
 
 async function handleDeleteStudent(studentId) {
@@ -2827,12 +3083,20 @@ function setupEventListeners() {
   });
 
   // Submissão do Aluno no Admin
+  setupEnrollmentTabs();
   document.getElementById('form-student-admin').addEventListener('submit', async (e) => {
     e.preventDefault();
     const editId = document.getElementById('student-edit-id').value;
     const checked = Array.from(document.querySelectorAll('input[name="admin_student_sub"]:checked')).map(cb => parseInt(cb.value));
 
-    const prefDaysArr = Array.from(document.querySelectorAll('#student-preferred-days-group input[name="pref_day"]:checked')).map(cb => cb.value);
+    // Aluno inativo não tem grade: as abas de matrícula só são exigidas para aluno ativo
+    const isActive = document.getElementById('student-status').value !== 'inativo';
+    const collected = isActive ? collectEnrollments() : { enrollments: undefined };
+    if (collected.error) {
+      if (collected.subjectId) { enr.active = collected.subjectId; renderEnrollmentTabs(); }
+      showAppAlert(collected.error, 'Matrícula');
+      return;
+    }
 
     const payload = {
       name: document.getElementById('student-name').value,
@@ -2845,12 +3109,7 @@ function setupEventListeners() {
       school_name: document.getElementById('student-school-name').value,
       school_contact_name: document.getElementById('student-school-contact').value,
       school_phone: document.getElementById('student-school-phone').value,
-      frequency_type: document.getElementById('student-frequency-type') ? document.getElementById('student-frequency-type').value : 'semanal',
-      custom_interval_days: document.getElementById('student-custom-days') ? parseInt(document.getElementById('student-custom-days').value) : 7,
-      preferred_days: prefDaysArr.join(','),
-      preferred_time: document.getElementById('student-preferred-time') ? document.getElementById('student-preferred-time').value : '08:00',
-      duration_minutes: document.getElementById('student-duration-minutes') ? parseInt(document.getElementById('student-duration-minutes').value) : 60,
-      assigned_teacher_id: document.getElementById('student-assigned-teacher') && document.getElementById('student-assigned-teacher').value ? parseInt(document.getElementById('student-assigned-teacher').value) : null,
+      enrollments: collected.enrollments,
       enrollment_notes: document.getElementById('student-enrollment-notes') ? document.getElementById('student-enrollment-notes').value : null,
       parent_name: document.getElementById('student-parent-name') ? document.getElementById('student-parent-name').value : undefined,
       parent_phone: document.getElementById('student-parent-phone') ? document.getElementById('student-parent-phone').value : undefined,
@@ -2870,6 +3129,10 @@ function setupEventListeners() {
       });
       if (!res.ok) {
         const d = await res.json();
+        if (d.subject_id && enrCheckedSubjects().includes(String(d.subject_id))) {
+          enr.active = String(d.subject_id);
+          renderEnrollmentTabs();
+        }
         throw new Error(d.error || 'Erro ao salvar aluno');
       }
 

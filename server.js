@@ -950,6 +950,19 @@ const STUDENT_SELECT = `
       FROM student_subjects ss JOIN subjects sub ON sub.id = ss.subject_id
       WHERE ss.student_id = st.id
     ), '[]') as subjects,
+    COALESCE((
+      SELECT json_agg(jsonb_build_object(
+        'schedule_id', ts.id, 'subject_id', ts.subject_id, 'subject_name', sub.name,
+        'teacher_id', ts.teacher_id, 'teacher_name', u.name,
+        'day_of_week', ts.day_of_week, 'start_time', ts.start_time, 'end_time', ts.end_time,
+        'frequency_type', ts.frequency_type, 'recurrence_interval_days', ts.recurrence_interval_days,
+        'start_date', to_char(ts.start_date, 'YYYY-MM-DD'), 'notes', ts.notes
+      ) ORDER BY sub.name, ts.start_time, ts.day_of_week)
+      FROM teacher_schedules ts
+      JOIN users u ON u.id = ts.teacher_id
+      LEFT JOIN subjects sub ON sub.id = ts.subject_id
+      WHERE ts.student_id = st.id AND ts.status = 'ativo'
+    ), '[]') as enrollments,
     lg.total_classes,
     lg.total_presences,
     lg.total_absences,
@@ -1141,6 +1154,135 @@ async function generateParentCode(db, name) {
   return `PAIS-${prefix}${Date.now().toString().slice(-6)}`;
 }
 
+/**
+ * Matrícula por matéria: cada item de `enrollments` é um horário do aluno numa matéria
+ * ({ subject_id, teacher_id, frequency_type, recurrence_interval_days, days, start_time,
+ * duration_minutes, start_date, notes }) e vira uma linha da grade por dia da semana.
+ * Toda matéria matriculada precisa de ao menos um horário com professor; a mesma matéria
+ * pode ter vários horários e professores diferentes.
+ * Sincroniza a grade do aluno: horários iguais (matéria, professor, dia e início) são
+ * atualizados, os novos são criados e os que saíram do formulário são inativados.
+ * Deve rodar dentro de uma transação. Retorna { error, subject_id } ou {}.
+ */
+async function saveStudentEnrollments(db, studentId, subjectIds, enrollments) {
+  const subjectSet = new Set(subjectIds);
+  if (subjectSet.size === 0) return { error: 'Selecione ao menos uma matéria para matricular o aluno.' };
+  if (!Array.isArray(enrollments)) return { error: 'Informe os horários de cada matéria matriculada.' };
+
+  const subjectNames = {};
+  (await db.query('SELECT id, name FROM subjects WHERE id = ANY($1::int[])', [[...subjectSet]]))
+    .rows.forEach(r => { subjectNames[r.id] = r.name; });
+
+  // Monta as linhas desejadas da grade, validando cada horário do formulário
+  const desired = [];
+  const covered = new Set();
+  for (let i = 0; i < enrollments.length; i++) {
+    const e = enrollments[i] || {};
+    const subjectId = parseInt(e.subject_id);
+    const label = subjectNames[subjectId] || 'Matéria';
+    const fail = msg => ({ error: `${label}: ${msg}`, subject_id: subjectId || null });
+
+    if (!subjectSet.has(subjectId)) return fail('a matéria do horário não está entre as matérias matriculadas.');
+    const teacherId = parseInt(e.teacher_id);
+    if (!teacherId) return fail('selecione o professor.');
+    const freq = e.frequency_type || 'semanal';
+    if (!VALID_FREQUENCIES.includes(freq)) return fail('periodicidade inválida.');
+    const interval = freq === 'custom_dias' ? parseInt(e.recurrence_interval_days) : (freq === 'quinzenal' ? 14 : 7);
+    if (!(interval >= 1 && interval <= 60)) return fail('informe a cada quantos dias acontece a aula (1 a 60).');
+    const days = [...new Set((Array.isArray(e.days) ? e.days : String(e.days || '').split(',')).map(d => parseInt(d)))]
+      .filter(d => d >= 0 && d <= 6);
+    if (days.length === 0) return fail('marque ao menos um dia da semana.');
+    const startTime = String(e.start_time || '').trim();
+    if (!TIME_RE.test(startTime)) return fail('informe o horário no formato HH:MM.');
+    const duration = parseInt(e.duration_minutes);
+    if (!(duration >= 15 && duration <= 480)) return fail('a duração deve ficar entre 15 e 480 minutos.');
+    const endTime = addMinutesToTime(startTime, duration);
+    if (!endTime) return fail('o horário somado à duração passa da meia-noite.');
+    const startDate = e.start_date && /^\d{4}-\d{2}-\d{2}$/.test(e.start_date) ? e.start_date : null;
+    const notes = (e.notes || '').trim() || null;
+
+    covered.add(subjectId);
+    for (const day of days) {
+      desired.push({ subjectId, teacherId, day, startTime, endTime, duration, freq, interval, startDate, notes, label });
+    }
+  }
+  const missing = [...subjectSet].filter(id => !covered.has(id));
+  if (missing.length > 0) {
+    return { error: `Preencha o horário e o professor de: ${missing.map(id => subjectNames[id] || id).join(', ')}.`, subject_id: missing[0] };
+  }
+
+  const existing = (await db.query(
+    "SELECT * FROM teacher_schedules WHERE student_id = $1 AND status = 'ativo' ORDER BY id", [studentId]
+  )).rows;
+  const keyOf = (subjectId, teacherId, day, start) => `${subjectId}|${teacherId}|${day}|${start}`;
+  const byKey = new Map();
+  existing.forEach(s => {
+    const k = keyOf(s.subject_id, s.teacher_id, s.day_of_week, s.start_time);
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(s);
+  });
+  desired.forEach(d => {
+    const list = byKey.get(keyOf(d.subjectId, d.teacherId, d.day, d.startTime));
+    d.match = list && list.length ? list.shift() : null;
+  });
+  const keepIds = new Set(desired.filter(d => d.match).map(d => d.match.id));
+
+  // 1. Horários que saíram do formulário deixam a grade (antes, para não gerar conflito falso)
+  const removeIds = existing.filter(s => !keepIds.has(s.id)).map(s => s.id);
+  if (removeIds.length > 0) {
+    await db.query(
+      "UPDATE teacher_schedules SET status = 'inativo', updated_at = CURRENT_TIMESTAMP WHERE id = ANY($1::int[])",
+      [removeIds]
+    );
+  }
+
+  const dayShort = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+  // 2. Atualiza os que já existiam e 3. cria os novos — todos pelas mesmas validações da Grade
+  const ordered = [...desired.filter(d => d.match), ...desired.filter(d => !d.match)];
+  for (const d of ordered) {
+    const check = await validateScheduleSlot(db, {
+      scheduleId: d.match ? d.match.id : null, teacherId: d.teacherId, studentId, subjectId: d.subjectId,
+      classroomId: d.match ? d.match.classroom_id : null, dayOfWeek: d.day, startTime: d.startTime, endTime: d.endTime
+    });
+    if (check.error) {
+      return { error: `${d.label} (${dayShort[d.day]} ${d.startTime}): ${check.error}`, subject_id: d.subjectId };
+    }
+    if (d.match) {
+      await db.query(`
+        UPDATE teacher_schedules
+        SET end_time = $1, frequency_type = $2, recurrence_interval_days = $3,
+            start_date = COALESCE($4::date, start_date), notes = $5, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $6
+      `, [d.endTime, d.freq, d.interval, d.startDate, d.notes, d.match.id]);
+    } else {
+      await db.query(`
+        INSERT INTO teacher_schedules
+          (teacher_id, student_id, subject_id, classroom_id, day_of_week, start_time, end_time,
+           frequency_type, recurrence_interval_days, room_or_info, notes, status, start_date)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Presencial / Online', $10, 'ativo', COALESCE($11::date, CURRENT_DATE))
+      `, [d.teacherId, studentId, d.subjectId, check.classroomId, d.day, d.startTime, d.endTime,
+          d.freq, d.interval, d.notes, d.startDate]);
+    }
+  }
+
+  await db.query('DELETE FROM student_subjects WHERE student_id = $1', [studentId]);
+  for (const subId of subjectSet) {
+    await db.query('INSERT INTO student_subjects (student_id, subject_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [studentId, subId]);
+  }
+
+  // Campos antigos de matrícula única ficam com o 1º horário (fila de pendências e telas legadas)
+  const first = desired[0];
+  const firstDays = desired.filter(d => d.subjectId === first.subjectId && d.teacherId === first.teacherId && d.startTime === first.startTime).map(d => d.day);
+  await db.query(`
+    UPDATE students SET frequency_type = $1, custom_interval_days = $2, preferred_days = $3,
+      preferred_time = $4, duration_minutes = $5
+    WHERE id = $6
+  `, [first.freq, first.interval, firstDays.join(','), first.startTime, first.duration, studentId]);
+
+  await syncStudentTeacher(db, studentId);
+  return {};
+}
+
 // Cadastrar novo Aluno com Matrícula & Frequência (Exclusivo Administrador)
 app.post('/api/students', authenticateToken, requireRole('admin'), async (req, res) => {
   const client = await pool.connect();
@@ -1148,8 +1290,7 @@ app.post('/api/students', authenticateToken, requireRole('admin'), async (req, r
     const {
       name, objective_grade, start_date, end_date,
       parent_name, parent_email, parent_phone, parent_access_code,
-      subject_ids, frequency_type, custom_interval_days, preferred_days, preferred_time,
-      duration_minutes, assigned_teacher_id, enrollment_notes,
+      subject_ids, enrollments, enrollment_notes,
       address, birth_date, school_name, school_contact_name, school_phone
     } = req.body;
 
@@ -1159,16 +1300,9 @@ app.post('/api/students', authenticateToken, requireRole('admin'), async (req, r
     const validationError = await validateStudentPayload(client, req.body);
     if (validationError) return res.status(400).json({ error: validationError });
 
-    let teacher = null;
-    if (assigned_teacher_id) {
-      teacher = await getActiveProfessor(client, parseInt(assigned_teacher_id));
-      if (!teacher) return res.status(400).json({ error: 'O professor selecionado não existe ou está inativo.' });
-    }
-
     const cleanCode = parent_access_code && parent_access_code.trim()
       ? parent_access_code.trim().toUpperCase()
       : await generateParentCode(client, name);
-    const freq = frequency_type || 'semanal';
     const subjectIds = Array.isArray(subject_ids) ? subject_ids.map(Number) : [];
 
     await client.query('BEGIN');
@@ -1176,11 +1310,10 @@ app.post('/api/students', authenticateToken, requireRole('admin'), async (req, r
       `INSERT INTO students (
         name, objective_grade, start_date, end_date, status,
         parent_name, parent_email, parent_phone, parent_access_code,
-        frequency_type, custom_interval_days, preferred_days, preferred_time, duration_minutes,
-        enrollment_status, assigned_teacher_id, enrollment_notes,
+        enrollment_status, enrollment_notes,
         address, birth_date, school_name, school_contact_name, school_phone
        )
-       VALUES ($1, $2, $3, $4, 'ativo', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+       VALUES ($1, $2, $3, $4, 'ativo', $5, $6, $7, $8, 'aguardando_professor', $9, $10, $11, $12, $13, $14)
        RETURNING *`,
       [
         name.trim(),
@@ -1191,13 +1324,6 @@ app.post('/api/students', authenticateToken, requireRole('admin'), async (req, r
         parent_email || '',
         parent_phone || '',
         cleanCode,
-        freq,
-        custom_interval_days ? parseInt(custom_interval_days) : (freq === 'quinzenal' ? 14 : 7),
-        preferred_days || '1',
-        preferred_time || '08:00',
-        duration_minutes ? parseInt(duration_minutes) : 60,
-        teacher ? 'ativo' : 'aguardando_professor',
-        teacher ? teacher.id : null,
         enrollment_notes || null,
         (address || '').trim() || null,
         birth_date || null,
@@ -1208,60 +1334,16 @@ app.post('/api/students', authenticateToken, requireRole('admin'), async (req, r
     );
     const newStudent = studentRes.rows[0];
 
-    for (const subId of subjectIds) {
-      await client.query(
-        `INSERT INTO student_subjects (student_id, subject_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-        [newStudent.id, subId]
-      );
-    }
-
-    // Com professor e dias preferidos, já gera a grade — passando pelas mesmas validações da Grade
-    if (teacher && preferred_days) {
-      const days = [...new Set(String(preferred_days).split(',').map(d => parseInt(d.trim())).filter(d => d >= 0 && d <= 6))];
-
-      let subId = null;
-      if (subjectIds.length > 0) {
-        const taught = await client.query(
-          'SELECT subject_id FROM teacher_subjects WHERE user_id = $1 AND subject_id = ANY($2::int[]) ORDER BY subject_id',
-          [teacher.id, subjectIds]
-        );
-        if (taught.rows.length === 0) {
-          await client.query('ROLLBACK');
-          return res.status(400).json({ error: `${teacher.name} não leciona nenhuma das matérias selecionadas para o aluno.` });
-        }
-        subId = taught.rows[0].subject_id;
-      }
-
-      const startTime = newStudent.preferred_time || '08:00';
-      const endTime = addMinutesToTime(startTime, newStudent.duration_minutes || 60);
-      if (!endTime) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'O horário preferido somado à duração passa da meia-noite.' });
-      }
-      const scheduleStart = toISODate(newStudent.start_date);
-
-      for (const day of days) {
-        const check = await validateScheduleSlot(client, {
-          teacherId: teacher.id, studentId: newStudent.id, subjectId: subId,
-          dayOfWeek: day, startTime, endTime
-        });
-        if (check.error) {
-          await client.query('ROLLBACK');
-          return res.status(400).json({ error: `Não foi possível montar a grade do aluno: ${check.error}` });
-        }
-        await client.query(`
-          INSERT INTO teacher_schedules
-            (teacher_id, student_id, subject_id, classroom_id, day_of_week, start_time, end_time, frequency_type, recurrence_interval_days, room_or_info, notes, status, start_date)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Presencial / Online', $10, 'ativo', COALESCE($11::date, CURRENT_DATE))
-        `, [
-          teacher.id, newStudent.id, subId, check.classroomId, day, startTime, endTime,
-          freq, newStudent.custom_interval_days || 7, `Matrícula: ${newStudent.name}`, scheduleStart
-        ]);
-      }
+    // Matrícula por matéria: gera a grade passando pelas mesmas validações da Grade
+    const saved = await saveStudentEnrollments(client, newStudent.id, subjectIds, enrollments);
+    if (saved.error) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: saved.error, subject_id: saved.subject_id });
     }
 
     await client.query('COMMIT');
-    res.status(201).json(newStudent);
+    const finalRes = await pool.query('SELECT * FROM students WHERE id = $1', [newStudent.id]);
+    res.status(201).json(finalRes.rows[0]);
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
@@ -1285,8 +1367,13 @@ app.put('/api/students/:id', authenticateToken, requireRole('admin'), async (req
     const validationError = await validateStudentPayload(client, body, id);
     if (validationError) return res.status(400).json({ error: validationError });
 
+    // Com `enrollments`, o formulário define a grade inteira do aluno (matrícula por matéria).
+    // Aluno inativo não tem grade: os horários só são exigidos quando ele fica ativo.
+    const finalStatus = body.status || current.status;
+    const syncEnrollments = Array.isArray(body.enrollments) && finalStatus === 'ativo';
+
     // Matérias que o aluno ainda cursa na grade não podem ser removidas
-    if (Array.isArray(body.subject_ids)) {
+    if (Array.isArray(body.subject_ids) && !syncEnrollments) {
       const keep = body.subject_ids.map(Number);
       const blocked = await client.query(`
         SELECT DISTINCT sub.name FROM teacher_schedules ts
@@ -1301,7 +1388,7 @@ app.put('/api/students/:id', authenticateToken, requireRole('admin'), async (req
     }
 
     let newTeacherId = current.assigned_teacher_id;
-    if (has('assigned_teacher_id')) {
+    if (has('assigned_teacher_id') && !syncEnrollments) {
       newTeacherId = body.assigned_teacher_id ? parseInt(body.assigned_teacher_id) : null;
       if (newTeacherId && newTeacherId !== current.assigned_teacher_id && !(await getActiveProfessor(client, newTeacherId))) {
         return res.status(400).json({ error: 'O professor selecionado não existe ou está inativo.' });
@@ -1356,7 +1443,13 @@ app.put('/api/students/:id', authenticateToken, requireRole('admin'), async (req
       }
     }
 
-    if (Array.isArray(body.subject_ids)) {
+    if (syncEnrollments) {
+      const saved = await saveStudentEnrollments(client, id, (body.subject_ids || []).map(Number), body.enrollments);
+      if (saved.error) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: saved.error, subject_id: saved.subject_id });
+      }
+    } else if (Array.isArray(body.subject_ids)) {
       await client.query('DELETE FROM student_subjects WHERE student_id = $1', [id]);
       for (const subId of body.subject_ids) {
         await client.query('INSERT INTO student_subjects (student_id, subject_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [id, subId]);
@@ -1372,7 +1465,7 @@ app.put('/api/students/:id', authenticateToken, requireRole('admin'), async (req
     }
 
     // Troca ou remoção do professor responsável
-    if (has('assigned_teacher_id') && newTeacherId !== current.assigned_teacher_id) {
+    if (has('assigned_teacher_id') && !syncEnrollments && newTeacherId !== current.assigned_teacher_id) {
       const oldTeacherId = current.assigned_teacher_id;
       if (!newTeacherId) {
         // Remover o professor: os horários dele com o aluno saem da grade
