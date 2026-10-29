@@ -574,6 +574,8 @@ function setupNavigation() {
         loadAdminSubjects();
       } else if (targetId === 'admin-classrooms-tab') {
         loadClassrooms();
+      } else if (targetId === 'admin-schools-tab') {
+        loadSchools();
       }
     });
   });
@@ -618,6 +620,7 @@ function switchView(viewId) {
     loadAdminStudents();
     loadAdminSubjects();
     loadClassrooms();
+    loadSchools();
   }
   if (viewId === 'view-reports') {
     initReportsView();
@@ -649,6 +652,7 @@ function switchView(viewId) {
 async function loadAllData() {
   await Promise.all([
     loadClassrooms(),
+    loadSchools(),
     loadSubjects(),
     loadStudents(),
     loadStats(),
@@ -840,7 +844,7 @@ function renderStudentCards() {
           <div class="card-top">
             <div>
               <div class="student-name">${st.name}</div>
-              <div class="student-grade">${st.objective_grade || 'Diário de Classe'}</div>
+              <div class="student-grade">${st.objective_grade || 'Diário de Classe'}${st.school_name ? ' • 🏫 ' + escapeHtml(st.school_name) : ''}</div>
             </div>
             <div class="presence-badge ${hasAbsences ? 'has-absences' : ''}">
               <span>${st.total_presences || 0} Presenças</span>
@@ -886,7 +890,7 @@ function renderStudentCards() {
                 </span>
               ` : ''}
             </div>
-            <div class="student-grade">${st.objective_grade || 'Diário de Classe'}</div>
+            <div class="student-grade">${st.objective_grade || 'Diário de Classe'}${st.school_name ? ' • 🏫 ' + escapeHtml(st.school_name) : ''}</div>
           </div>
           <div class="presence-badge ${hasAbsences ? 'has-absences' : ''}">
             <span>${st.total_presences || 0} Presenças</span>
@@ -1750,6 +1754,7 @@ function handleToggleStudentStatus(studentId, currentStatus) {
       showToast(activating ? 'Aluno reativado.' : 'Aluno inativado.');
       loadAdminStudents();
       loadStudents();
+      loadSchools();
       loadStats();
       loadSchedules();
     } catch (err) {
@@ -1764,6 +1769,9 @@ async function openStudentModalAdmin(studentId = null) {
   }
   if (!state.subjects || state.subjects.length === 0) {
     try { await loadSubjects(); } catch (e) {}
+  }
+  if (!state.schools || state.schools.length === 0) {
+    try { await loadSchools(); } catch (e) {}
   }
 
   const modal = document.getElementById('modal-student-admin');
@@ -1793,6 +1801,12 @@ async function openStudentModalAdmin(studentId = null) {
     document.getElementById('student-status').value = student.status || 'ativo';
     document.getElementById('student-birth-date').value = student.birth_date ? String(student.birth_date).slice(0, 10) : '';
     document.getElementById('student-address').value = student.address || '';
+    let matchedSchoolId = student.school_id || '';
+    if (!matchedSchoolId && student.school_name && Array.isArray(state.schools)) {
+      const foundSc = state.schools.find(sc => sc.name.toLowerCase().trim() === student.school_name.toLowerCase().trim());
+      if (foundSc) matchedSchoolId = foundSc.id;
+    }
+    populateStudentSchoolSelect(matchedSchoolId);
     document.getElementById('student-school-name').value = student.school_name || '';
     document.getElementById('student-school-contact').value = student.school_contact_name || '';
     document.getElementById('student-school-phone').value = student.school_phone || '';
@@ -1819,6 +1833,10 @@ async function openStudentModalAdmin(studentId = null) {
   } else {
     title.textContent = 'Cadastrar Novo Aluno';
     document.getElementById('student-edit-id').value = '';
+    populateStudentSchoolSelect('');
+    document.getElementById('student-school-name').value = '';
+    document.getElementById('student-school-contact').value = '';
+    document.getElementById('student-school-phone').value = '';
     const parentCodeEl = document.getElementById('student-parent-code');
     if (parentCodeEl) parentCodeEl.value = 'PAIS-' + Math.floor(1000 + Math.random() * 9000);
     if (document.getElementById('student-enrollment-notes')) document.getElementById('student-enrollment-notes').value = '';
@@ -3256,6 +3274,7 @@ function setupEventListeners() {
       status: document.getElementById('student-status').value,
       birth_date: document.getElementById('student-birth-date').value || null,
       address: document.getElementById('student-address').value,
+      school_id: document.getElementById('student-school-id')?.value ? parseInt(document.getElementById('student-school-id').value) : null,
       school_name: document.getElementById('student-school-name').value,
       school_contact_name: document.getElementById('student-school-contact').value,
       school_phone: document.getElementById('student-school-phone').value,
@@ -10286,3 +10305,376 @@ function exportTeacherLessonsCSV() {
   URL.revokeObjectURL(url);
   showToast('Relatório CSV exportado com sucesso!', 'success');
 }
+
+
+// ============================================================================
+// GESTÃO DE ESCOLAS DE ORIGEM DOS ESTUDANTES (ADMIN)
+// ============================================================================
+
+state.schools = [];
+state.adminSchoolSearch = '';
+state.returnToStudentModalAfterSchool = false;
+state.schoolsEventsBound = false;
+
+const SCHOOL_TYPE_LABELS = {
+  estadual: '🏛️ Rede Estadual',
+  municipal: '🏫 Rede Municipal',
+  privada: '🎓 Rede Particular / Privada',
+  federal: '🇧🇷 Rede Federal / IF',
+  outra: '📌 Outra Instituição'
+};
+
+function openAdminSubtab(subtabId) {
+  switchView('view-admin');
+  const btn = document.querySelector(`.admin-subtab[data-subtab="${subtabId}"]`);
+  if (btn) btn.click();
+}
+
+async function loadSchools() {
+  bindSchoolsEventsOnce();
+  const container = document.getElementById('admin-schools-cards-list');
+  try {
+    const res = await fetch(`${API_BASE}/api/schools`, { headers: getAuthHeaders() });
+    if (!res.ok) throw new Error('Falha ao carregar escolas');
+    state.schools = await res.json();
+    renderAdminSchoolsList();
+    const sel = document.getElementById('student-school-id');
+    if (sel) populateStudentSchoolSelect(sel.value);
+  } catch (err) {
+    console.error('Erro ao carregar escolas:', err);
+    if (container) {
+      container.innerHTML = `<p style="color:var(--danger); text-align:center;">${escapeHtml(err.message)}</p>`;
+    }
+  }
+}
+
+function populateStudentSchoolSelect(selectedId = '') {
+  const select = document.getElementById('student-school-id');
+  if (!select) return;
+
+  const schools = (state.schools || []).filter(sc => sc.status === 'ativo' || String(sc.id) === String(selectedId));
+  let html = '<option value="">-- Sem escola vinculada / Não possui escola --</option>';
+
+  schools.forEach(sc => {
+    const typeLabel = SCHOOL_TYPE_LABELS[sc.type] ? SCHOOL_TYPE_LABELS[sc.type].replace(/^[^ ]+ /, '') : 'Escola';
+    const cityPart = sc.city ? ` • ${sc.city}` : '';
+    const isSelected = String(sc.id) === String(selectedId) ? 'selected' : '';
+    html += `<option value="${sc.id}" ${isSelected}>🏫 ${escapeHtml(sc.name)} (${escapeHtml(typeLabel)}${escapeHtml(cityPart)})</option>`;
+  });
+
+  select.innerHTML = html;
+  select.value = selectedId ? String(selectedId) : '';
+}
+
+function renderAdminSchoolsList() {
+  const container = document.getElementById('admin-schools-cards-list');
+  const counter = document.getElementById('admin-schools-counter');
+  if (!container) return;
+
+  let list = state.schools || [];
+  if (state.adminSchoolSearch) {
+    const q = state.adminSchoolSearch.toLowerCase().trim();
+    list = list.filter(sc =>
+      (sc.name && sc.name.toLowerCase().includes(q)) ||
+      (sc.city && sc.city.toLowerCase().includes(q)) ||
+      (sc.contact_name && sc.contact_name.toLowerCase().includes(q)) ||
+      (sc.type && sc.type.toLowerCase().includes(q)) ||
+      (sc.address && sc.address.toLowerCase().includes(q))
+    );
+  }
+
+  if (counter) {
+    counter.textContent = `${list.length} escola(s) cadastrada(s)`;
+  }
+
+  if (list.length === 0) {
+    container.innerHTML = `
+      <div style="text-align:center; padding:32px 20px; color:var(--text-dim);">
+        <p style="font-size:1.05rem; font-weight:700; margin-bottom:6px;">🏫 Nenhuma escola encontrada</p>
+        <span class="text-xs">Cadastre as escolas de onde vêm os estudantes clicando em "➕ Cadastrar Escola" acima.</span>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = list.map(sc => {
+    const typeLabel = SCHOOL_TYPE_LABELS[sc.type] || '🏫 Escola';
+    const studentsList = Array.isArray(sc.students) ? sc.students : [];
+    const activeCount = parseInt(sc.active_students_count || 0);
+    const totalCount = parseInt(sc.total_students_count || studentsList.length || 0);
+
+    return `
+      <div class="classroom-card">
+        <div class="classroom-card-header">
+          <div class="classroom-title-box">
+            <div class="classroom-avatar-icon">
+              🏫
+            </div>
+            <div class="classroom-name-box">
+              <h4>${escapeHtml(sc.name)}</h4>
+              <div class="classroom-badges-row">
+                <span class="classroom-pill type-presencial">${escapeHtml(typeLabel)}</span>
+                ${sc.city ? `<span class="classroom-pill cap-students">📍 ${escapeHtml(sc.city)}</span>` : ''}
+                <span class="classroom-pill cap-teachers">🎓 ${activeCount} aluno(s) ativo(s)</span>
+                <span class="status-badge ${sc.status || 'ativo'}">${(sc.status || 'ativo') === 'ativo' ? 'Ativa' : 'Inativa'}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:8px; font-size:0.83rem; color:var(--text-main); background:#f8fafc; padding:10px 12px; border-radius:8px; border:1px solid var(--border-color);">
+          <div>
+            <span class="text-xs text-muted" style="display:block; font-weight:700;">👤 Contato / Coordenação:</span>
+            <strong>${sc.contact_name ? escapeHtml(sc.contact_name) : '<span class="text-muted">Não informado</span>'}</strong>
+          </div>
+          <div>
+            <span class="text-xs text-muted" style="display:block; font-weight:700;">📞 Telefone / WhatsApp:</span>
+            <strong>${sc.phone ? escapeHtml(sc.phone) : '<span class="text-muted">Não informado</span>'}</strong>
+          </div>
+          <div>
+            <span class="text-xs text-muted" style="display:block; font-weight:700;">✉️ E-mail:</span>
+            <strong>${sc.email ? escapeHtml(sc.email) : '<span class="text-muted">Não informado</span>'}</strong>
+          </div>
+          ${sc.address ? `
+            <div style="grid-column: 1 / -1;">
+              <span class="text-xs text-muted" style="display:block; font-weight:700;">🗺️ Endereço:</span>
+              <span>${escapeHtml(sc.address)}</span>
+            </div>
+          ` : ''}
+        </div>
+
+        ${sc.notes ? `
+          <div class="classroom-desc">
+            📝 ${escapeHtml(sc.notes)}
+          </div>
+        ` : ''}
+
+        <div>
+          <span class="text-xs text-muted" style="font-weight:700; text-transform:uppercase; letter-spacing:0.5px;">
+            Estudantes vinculados a esta escola (${totalCount}):
+          </span>
+          <div class="classroom-resources-tags" style="margin-top:6px;">
+            ${studentsList.length > 0
+              ? studentsList.map(st => `
+                  <button type="button" class="resource-tag btn-school-student-chip" data-student-id="${st.id}" style="cursor:pointer; border:1px solid #cbd5e1;" title="Clique para abrir o cadastro de ${escapeHtml(st.name)}">
+                    🎓 ${escapeHtml(st.name)}${st.objective_grade ? ' (' + escapeHtml(st.objective_grade) + ')' : ''}
+                  </button>
+                `).join('')
+              : '<span class="text-xs text-dim">Nenhum estudante vinculado a esta escola no momento</span>'}
+          </div>
+        </div>
+
+        <div class="classroom-card-actions">
+          <span class="text-xs text-muted">
+            ID #${sc.id} • Cadastro de Escola Parceira / Origem
+          </span>
+          <div class="btn-card-group">
+            <button type="button" class="btn-action-sm btn-edit-school-admin" data-id="${sc.id}">✏️ Editar</button>
+            <button type="button" class="btn-action-sm danger btn-delete-school-admin" data-id="${sc.id}" data-name="${escapeHtml(sc.name)}">🗑️ Excluir</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  container.querySelectorAll('.btn-edit-school-admin').forEach(btn => {
+    btn.addEventListener('click', () => openSchoolModalAdmin(btn.getAttribute('data-id')));
+  });
+
+  container.querySelectorAll('.btn-delete-school-admin').forEach(btn => {
+    btn.addEventListener('click', () => handleDeleteSchool(btn.getAttribute('data-id'), btn.getAttribute('data-name')));
+  });
+
+  container.querySelectorAll('.btn-school-student-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const stId = chip.getAttribute('data-student-id');
+      if (stId) openStudentModalAdmin(stId);
+    });
+  });
+}
+
+function openSchoolModalAdmin(schoolId = null, fromStudentModal = false) {
+  bindSchoolsEventsOnce();
+  state.returnToStudentModalAfterSchool = Boolean(fromStudentModal);
+
+  const modal = document.getElementById('modal-school-admin');
+  const title = document.getElementById('school-modal-title');
+  const form = document.getElementById('form-school-admin');
+  if (!modal || !form) return;
+
+  form.reset();
+
+  if (schoolId) {
+    const sc = (state.schools || []).find(item => String(item.id) === String(schoolId));
+    if (!sc) return;
+
+    title.textContent = 'Editar Escola';
+    document.getElementById('school-edit-id').value = sc.id;
+    document.getElementById('school-name').value = sc.name || '';
+    document.getElementById('school-type').value = sc.type || 'estadual';
+    document.getElementById('school-city').value = sc.city || '';
+    document.getElementById('school-address').value = sc.address || '';
+    document.getElementById('school-contact-name').value = sc.contact_name || '';
+    document.getElementById('school-phone').value = sc.phone || '';
+    document.getElementById('school-email').value = sc.email || '';
+    document.getElementById('school-status').value = sc.status || 'ativo';
+    document.getElementById('school-notes').value = sc.notes || '';
+  } else {
+    title.textContent = 'Cadastrar Nova Escola';
+    document.getElementById('school-edit-id').value = '';
+    document.getElementById('school-type').value = 'estadual';
+    document.getElementById('school-status').value = 'ativo';
+  }
+
+  modal.classList.remove('hidden');
+}
+
+function closeSchoolModalAdmin() {
+  const modal = document.getElementById('modal-school-admin');
+  if (modal) modal.classList.add('hidden');
+  state.returnToStudentModalAfterSchool = false;
+}
+
+async function handleDeleteSchool(schoolId, schoolName) {
+  showAppConfirm(
+    `Deseja realmente excluir a escola "${schoolName || ''}"? Os estudantes vinculados a ela não serão excluídos (apenas ficarão sem escola vinculada).`,
+    async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/schools/${schoolId}`, {
+          method: 'DELETE',
+          headers: getAuthHeaders()
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Erro ao excluir escola');
+
+        showToast('Escola excluída com sucesso!');
+        await loadSchools();
+        loadAdminStudents();
+        loadStudents();
+      } catch (err) {
+        showAppAlert(err.message, 'Erro ao Excluir Escola');
+      }
+    },
+    'Excluir Escola',
+    true
+  );
+}
+
+function bindSchoolsEventsOnce() {
+  if (state.schoolsEventsBound) return;
+  state.schoolsEventsBound = true;
+
+  const btnAddSchool = document.getElementById('btn-add-school-admin');
+  if (btnAddSchool) {
+    btnAddSchool.addEventListener('click', () => openSchoolModalAdmin(null, false));
+  }
+
+  const btnQuickAddFromStudent = document.getElementById('btn-quick-add-school-from-student');
+  if (btnQuickAddFromStudent) {
+    btnQuickAddFromStudent.addEventListener('click', () => openSchoolModalAdmin(null, true));
+  }
+
+  const btnCloseSchool = document.getElementById('btn-close-school-modal');
+  if (btnCloseSchool) {
+    btnCloseSchool.addEventListener('click', closeSchoolModalAdmin);
+  }
+
+  const btnCancelSchool = document.getElementById('btn-cancel-school');
+  if (btnCancelSchool) {
+    btnCancelSchool.addEventListener('click', closeSchoolModalAdmin);
+  }
+
+  const searchInput = document.getElementById('input-admin-school-search');
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => {
+      state.adminSchoolSearch = e.target.value;
+      renderAdminSchoolsList();
+    });
+  }
+
+  // Ao selecionar uma escola no cadastro do aluno, preenche nome, contato e telefone automaticamente
+  const studentSchoolSelect = document.getElementById('student-school-id');
+  if (studentSchoolSelect) {
+    studentSchoolSelect.addEventListener('change', () => {
+      const scId = studentSchoolSelect.value;
+      const nameInput = document.getElementById('student-school-name');
+      const contactInput = document.getElementById('student-school-contact');
+      const phoneInput = document.getElementById('student-school-phone');
+
+      if (!scId) {
+        if (nameInput) nameInput.value = '';
+        if (contactInput) contactInput.value = '';
+        if (phoneInput) phoneInput.value = '';
+        return;
+      }
+
+      const sc = (state.schools || []).find(item => String(item.id) === String(scId));
+      if (sc) {
+        if (nameInput) nameInput.value = sc.name || '';
+        if (contactInput) contactInput.value = sc.contact_name || '';
+        if (phoneInput) phoneInput.value = sc.phone || '';
+      }
+    });
+  }
+
+  const formSchool = document.getElementById('form-school-admin');
+  if (formSchool) {
+    formSchool.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const editId = document.getElementById('school-edit-id').value;
+      const payload = {
+        name: document.getElementById('school-name').value.trim(),
+        type: document.getElementById('school-type').value,
+        city: document.getElementById('school-city').value.trim(),
+        address: document.getElementById('school-address').value.trim(),
+        contact_name: document.getElementById('school-contact-name').value.trim(),
+        phone: document.getElementById('school-phone').value.trim(),
+        email: document.getElementById('school-email').value.trim(),
+        status: document.getElementById('school-status').value,
+        notes: document.getElementById('school-notes').value.trim()
+      };
+
+      if (!payload.name) {
+        showAppAlert('Informe o nome da escola.', 'Cadastro de Escola');
+        return;
+      }
+
+      const url = editId ? `${API_BASE}/api/schools/${editId}` : `${API_BASE}/api/schools`;
+      const method = editId ? 'PUT' : 'POST';
+
+      try {
+        const res = await fetch(url, {
+          method,
+          headers: getAuthHeaders(),
+          body: JSON.stringify(payload)
+        });
+        const savedSchool = await res.json();
+        if (!res.ok) throw new Error(savedSchool.error || 'Erro ao salvar escola');
+
+        const shouldSelectInStudent = state.returnToStudentModalAfterSchool;
+        closeSchoolModalAdmin();
+        showToast(editId ? 'Escola atualizada com sucesso!' : 'Escola cadastrada com sucesso!');
+
+        await loadSchools();
+        loadAdminStudents();
+        loadStudents();
+
+        if (shouldSelectInStudent && savedSchool && savedSchool.id) {
+          populateStudentSchoolSelect(savedSchool.id);
+          const nameInput = document.getElementById('student-school-name');
+          const contactInput = document.getElementById('student-school-contact');
+          const phoneInput = document.getElementById('student-school-phone');
+          if (nameInput) nameInput.value = savedSchool.name || '';
+          if (contactInput && savedSchool.contact_name) contactInput.value = savedSchool.contact_name;
+          if (phoneInput && savedSchool.phone) phoneInput.value = savedSchool.phone;
+        }
+      } catch (err) {
+        showAppAlert(err.message, 'Cadastro de Escola');
+      }
+    });
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  bindSchoolsEventsOnce();
+});

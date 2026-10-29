@@ -442,9 +442,47 @@ async function initDB(seedDataFn) {
         ALTER TABLE leads_contacts ADD COLUMN IF NOT EXISTS in_kanban BOOLEAN DEFAULT false;
         ALTER TABLE students ADD COLUMN IF NOT EXISTS address TEXT;
         ALTER TABLE students ADD COLUMN IF NOT EXISTS birth_date DATE;
-        ALTER TABLE students ADD COLUMN IF NOT EXISTS school_name VARCHAR(150);
+                ALTER TABLE students ADD COLUMN IF NOT EXISTS school_name VARCHAR(150);
         ALTER TABLE students ADD COLUMN IF NOT EXISTS school_contact_name VARCHAR(150);
         ALTER TABLE students ADD COLUMN IF NOT EXISTS school_phone VARCHAR(50);
+
+        -- Tabela de Escolas de Origem dos Estudantes
+        CREATE TABLE IF NOT EXISTS schools (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(150) NOT NULL,
+          type VARCHAR(40) DEFAULT 'estadual', -- 'estadual', 'municipal', 'privada', 'federal', 'outra'
+          contact_name VARCHAR(150),
+          phone VARCHAR(50),
+          email VARCHAR(150),
+          address TEXT,
+          city VARCHAR(100),
+          notes TEXT,
+          status VARCHAR(20) DEFAULT 'ativo',
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+
+        ALTER TABLE students ADD COLUMN IF NOT EXISTS school_id INT REFERENCES schools(id) ON DELETE SET NULL;
+
+        -- Migra escolas já preenchidas em texto nos alunos para a tabela schools e vincula school_id
+        INSERT INTO schools (name, contact_name, phone, status)
+        SELECT DISTINCT ON (LOWER(TRIM(school_name)))
+          TRIM(school_name),
+          NULLIF(TRIM(school_contact_name), ''),
+          NULLIF(TRIM(school_phone), ''),
+          'ativo'
+        FROM students
+        WHERE school_name IS NOT NULL AND TRIM(school_name) <> ''
+          AND NOT EXISTS (
+            SELECT 1 FROM schools sc WHERE LOWER(TRIM(sc.name)) = LOWER(TRIM(students.school_name))
+          );
+
+        UPDATE students st
+        SET school_id = sc.id
+        FROM schools sc
+        WHERE st.school_id IS NULL
+          AND st.school_name IS NOT NULL
+          AND LOWER(TRIM(st.school_name)) = LOWER(TRIM(sc.name));
 
         -- Contato do professor
         ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);

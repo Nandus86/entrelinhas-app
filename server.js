@@ -941,6 +941,13 @@ app.delete('/api/teacher-documents/:docId', authenticateToken, requireAdmin, asy
 const STUDENT_SELECT = `
   SELECT
     st.*,
+    COALESCE(sc.name, st.school_name) as school_name,
+    COALESCE(sc.contact_name, st.school_contact_name) as school_contact_name,
+    COALESCE(sc.phone, st.school_phone) as school_phone,
+    sc.type as school_type,
+    sc.city as school_city,
+    sc.address as school_address,
+    sc.email as school_email,
     to_char(st.birth_date, 'YYYY-MM-DD') as birth_date,
     to_char(st.birth_date, 'DD/MM') as birthday_br,
     u_teach.name as assigned_teacher_name,
@@ -983,6 +990,7 @@ const STUDENT_SELECT = `
       LIMIT 1
     ) as last_class_formatted
   FROM students st
+  LEFT JOIN schools sc ON sc.id = st.school_id
   LEFT JOIN users u_teach ON u_teach.id = st.assigned_teacher_id
   LEFT JOIN LATERAL (
     SELECT
@@ -1291,7 +1299,7 @@ app.post('/api/students', authenticateToken, requireRole('admin'), async (req, r
       name, objective_grade, start_date, end_date,
       parent_name, parent_email, parent_phone, parent_access_code,
       subject_ids, enrollments, enrollment_notes,
-      address, birth_date, school_name, school_contact_name, school_phone
+      address, birth_date, school_id, school_name, school_contact_name, school_phone
     } = req.body;
 
     if (!name || !name.trim()) {
@@ -1306,14 +1314,31 @@ app.post('/api/students', authenticateToken, requireRole('admin'), async (req, r
     const subjectIds = Array.isArray(subject_ids) ? subject_ids.map(Number) : [];
 
     await client.query('BEGIN');
+    let resolvedSchoolId = school_id ? parseInt(school_id) : null;
+    let resolvedSchoolName = (school_name || '').trim() || null;
+    let resolvedSchoolContact = (school_contact_name || '').trim() || null;
+    let resolvedSchoolPhone = (school_phone || '').trim() || null;
+
+    if (resolvedSchoolId) {
+      const scRes = await client.query('SELECT * FROM schools WHERE id = $1', [resolvedSchoolId]);
+      if (scRes.rows.length > 0) {
+        const sc = scRes.rows[0];
+        resolvedSchoolName = sc.name;
+        if (!resolvedSchoolContact && sc.contact_name) resolvedSchoolContact = sc.contact_name;
+        if (!resolvedSchoolPhone && sc.phone) resolvedSchoolPhone = sc.phone;
+      } else {
+        resolvedSchoolId = null;
+      }
+    }
+
     const studentRes = await client.query(
       `INSERT INTO students (
         name, objective_grade, start_date, end_date, status,
         parent_name, parent_email, parent_phone, parent_access_code,
         enrollment_status, enrollment_notes,
-        address, birth_date, school_name, school_contact_name, school_phone
+        address, birth_date, school_id, school_name, school_contact_name, school_phone
        )
-       VALUES ($1, $2, $3, $4, 'ativo', $5, $6, $7, $8, 'aguardando_professor', $9, $10, $11, $12, $13, $14)
+       VALUES ($1, $2, $3, $4, 'ativo', $5, $6, $7, $8, 'aguardando_professor', $9, $10, $11, $12, $13, $14, $15)
        RETURNING *`,
       [
         name.trim(),
@@ -1327,9 +1352,10 @@ app.post('/api/students', authenticateToken, requireRole('admin'), async (req, r
         enrollment_notes || null,
         (address || '').trim() || null,
         birth_date || null,
-        (school_name || '').trim() || null,
-        (school_contact_name || '').trim() || null,
-        (school_phone || '').trim() || null
+        resolvedSchoolId,
+        resolvedSchoolName,
+        resolvedSchoolContact,
+        resolvedSchoolPhone
       ]
     );
     const newStudent = studentRes.rows[0];
@@ -1440,6 +1466,32 @@ app.put('/api/students/:id', authenticateToken, requireRole('admin'), async (req
       if (has(f)) {
         const v = body[f] === null || body[f] === undefined ? null : (String(body[f]).trim() || null);
         await client.query(`UPDATE students SET ${f} = $1 WHERE id = $2`, [v, id]);
+      }
+    }
+
+    if (has('school_id')) {
+      const scId = body.school_id ? parseInt(body.school_id) : null;
+      if (scId) {
+        const scRes = await client.query('SELECT * FROM schools WHERE id = $1', [scId]);
+        if (scRes.rows.length > 0) {
+          const sc = scRes.rows[0];
+          await client.query(
+            `UPDATE students
+             SET school_id = $1,
+                 school_name = $2,
+                 school_contact_name = COALESCE(NULLIF($3, ''), $4),
+                 school_phone = COALESCE(NULLIF($5, ''), $6)
+             WHERE id = $7`,
+            [sc.id, sc.name, body.school_contact_name || '', sc.contact_name || null, body.school_phone || '', sc.phone || null, id]
+          );
+        } else {
+          await client.query('UPDATE students SET school_id = NULL WHERE id = $1', [id]);
+        }
+      } else {
+        await client.query('UPDATE students SET school_id = NULL WHERE id = $1', [id]);
+        if (!has('school_name') || !body.school_name) {
+          await client.query('UPDATE students SET school_name = NULL WHERE id = $1', [id]);
+        }
       }
     }
 
@@ -2109,6 +2161,209 @@ app.delete('/api/classrooms/:id', authenticateToken, requireRole('admin'), async
     res.json({ message: 'Sala excluída com sucesso!' });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ==========================================
+// CADASTRO DE ESCOLAS DE ORIGEM DOS ALUNOS
+// ==========================================
+
+// Listar todas as escolas cadastradas com contagem e lista de estudantes vinculados
+app.get('/api/schools', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        sc.*,
+        (SELECT COUNT(*) FROM students st WHERE st.school_id = sc.id AND st.status = 'ativo') as active_students_count,
+        (SELECT COUNT(*) FROM students st WHERE st.school_id = sc.id) as total_students_count,
+        COALESCE((
+          SELECT json_agg(jsonb_build_object(
+            'id', st.id,
+            'name', st.name,
+            'objective_grade', st.objective_grade,
+            'status', st.status
+          ) ORDER BY st.name ASC)
+          FROM students st
+          WHERE st.school_id = sc.id
+        ), '[]') as students
+      FROM schools sc
+      ORDER BY sc.name ASC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao listar escolas: ' + err.message });
+  }
+});
+
+// Detalhes de uma escola específica
+app.get('/api/schools/:id', authenticateToken, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const result = await pool.query('SELECT * FROM schools WHERE id = $1', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Escola não encontrada.' });
+    }
+    const studentsRes = await pool.query(
+      'SELECT id, name, objective_grade, status, parent_name, parent_phone FROM students WHERE school_id = $1 ORDER BY name ASC',
+      [id]
+    );
+    res.json({
+      school: result.rows[0],
+      students: studentsRes.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar escola: ' + err.message });
+  }
+});
+
+// Cadastrar nova Escola (Exclusivo Administrador)
+app.post('/api/schools', authenticateToken, requireRole('admin'), async (req, res) => {
+  try {
+    const {
+      name,
+      type = 'estadual',
+      contact_name,
+      phone,
+      email,
+      address,
+      city,
+      notes,
+      status = 'ativo'
+    } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'O nome da escola é obrigatório.' });
+    }
+
+    const cleanName = name.trim();
+    const dup = await pool.query('SELECT id FROM schools WHERE LOWER(TRIM(name)) = LOWER($1)', [cleanName]);
+    if (dup.rows.length > 0) {
+      return res.status(400).json({ error: `Já existe uma escola cadastrada com o nome "${cleanName}".` });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO schools (name, type, contact_name, phone, email, address, city, notes, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [
+        cleanName,
+        (type || 'estadual').trim(),
+        (contact_name || '').trim() || null,
+        (phone || '').trim() || null,
+        (email || '').trim() || null,
+        (address || '').trim() || null,
+        (city || '').trim() || null,
+        (notes || '').trim() || null,
+        status === 'inativo' ? 'inativo' : 'ativo'
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao cadastrar escola: ' + err.message });
+  }
+});
+
+// Atualizar Escola (Exclusivo Administrador)
+app.put('/api/schools/:id', authenticateToken, requireRole('admin'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = parseInt(req.params.id);
+    const {
+      name,
+      type,
+      contact_name,
+      phone,
+      email,
+      address,
+      city,
+      notes,
+      status
+    } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'O nome da escola é obrigatório.' });
+    }
+
+    const cleanName = name.trim();
+    const dup = await client.query('SELECT id FROM schools WHERE LOWER(TRIM(name)) = LOWER($1) AND id <> $2', [cleanName, id]);
+    if (dup.rows.length > 0) {
+      return res.status(400).json({ error: `Já existe outra escola cadastrada com o nome "${cleanName}".` });
+    }
+
+    await client.query('BEGIN');
+    const result = await client.query(
+      `UPDATE schools
+       SET name = $1,
+           type = COALESCE($2, type),
+           contact_name = $3,
+           phone = $4,
+           email = $5,
+           address = $6,
+           city = $7,
+           notes = $8,
+           status = COALESCE($9, status),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $10
+       RETURNING *`,
+      [
+        cleanName,
+        type ? type.trim() : null,
+        (contact_name || '').trim() || null,
+        (phone || '').trim() || null,
+        (email || '').trim() || null,
+        (address || '').trim() || null,
+        (city || '').trim() || null,
+        (notes || '').trim() || null,
+        status || null,
+        id
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Escola não encontrada.' });
+    }
+
+    // Mantém o nome da escola sincronizado nos alunos vinculados a ela
+    await client.query(
+      'UPDATE students SET school_name = $1 WHERE school_id = $2',
+      [cleanName, id]
+    );
+
+    await client.query('COMMIT');
+    res.json(result.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Erro ao atualizar escola: ' + err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Excluir Escola (Exclusivo Administrador)
+app.delete('/api/schools/:id', authenticateToken, requireRole('admin'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = parseInt(req.params.id);
+    const exists = await client.query('SELECT id, name FROM schools WHERE id = $1', [id]);
+    if (exists.rows.length === 0) {
+      return res.status(404).json({ error: 'Escola não encontrada.' });
+    }
+
+    await client.query('BEGIN');
+    // Desvincula os estudantes que estavam ligados a esta escola
+    await client.query('UPDATE students SET school_id = NULL, school_name = NULL WHERE school_id = $1', [id]);
+    await client.query('DELETE FROM schools WHERE id = $1', [id]);
+    await client.query('COMMIT');
+
+    res.json({ message: 'Escola excluída com sucesso!' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Erro ao excluir escola: ' + err.message });
+  } finally {
+    client.release();
   }
 });
 

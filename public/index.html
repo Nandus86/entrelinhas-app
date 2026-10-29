@@ -893,6 +893,13 @@
                   <small>Grade e diários preenchidos</small>
                 </div>
               </button>
+              <button class="shortcut-btn" onclick="openAdminSubtab('admin-schools-tab')">
+                <span class="shortcut-icon">🏫</span>
+                <div>
+                  <strong>Escolas de Origem</strong>
+                  <small>Colégios dos estudantes</small>
+                </div>
+              </button>
             </div>
           </div>
         </section>
@@ -1214,6 +1221,9 @@
             <button class="admin-subtab" data-subtab="admin-subjects-tab" id="btn-subtab-subjects">
               <span>📚 Matérias</span>
             </button>
+            <button class="admin-subtab" data-subtab="admin-schools-tab" id="btn-subtab-schools">
+              <span>🏫 Escolas</span>
+            </button>
             <button class="admin-subtab" data-subtab="admin-classrooms-tab" id="btn-subtab-classrooms">
               <span>🏛️ Salas & Recursos</span>
             </button>
@@ -1301,6 +1311,28 @@
             </div>
 
             <div id="admin-classrooms-cards-list" class="cards-list">
+              <!-- Injetado dinamicamente -->
+            </div>
+          </div>
+
+          <!-- SEÇÃO 5 DO ADMIN: ESCOLAS DE ORIGEM DOS ESTUDANTES -->
+          <div id="admin-schools-tab" class="admin-tab-content hidden">
+            <div class="admin-section-bar">
+              <div>
+                <h3>Escolas de Origem dos Estudantes</h3>
+                <span class="text-sm text-muted" id="admin-schools-counter">Carregando escolas...</span>
+              </div>
+              <button id="btn-add-school-admin" class="btn-primary-action">
+                <span>➕ Cadastrar Escola</span>
+              </button>
+            </div>
+
+            <div class="search-input-wrapper" style="margin-bottom: 12px;">
+              <span class="search-icon">🔍</span>
+              <input type="text" id="input-admin-school-search" placeholder="Filtrar escolas por nome, cidade, rede ou contato…" aria-label="Buscar escola">
+            </div>
+
+            <div id="admin-schools-cards-list" class="cards-list">
               <!-- Injetado dinamicamente -->
             </div>
           </div>
@@ -2598,8 +2630,16 @@
           </div>
 
           <div class="form-group">
-            <label for="student-school-name">Colégio</label>
-            <input type="text" id="student-school-name" placeholder="Ex: Escola Estadual ...">
+            <label for="student-school-id">Escola / Colégio de Origem <small class="text-xs text-muted">(Opcional — nem todos os alunos possuem escola)</small></label>
+            <div class="input-with-button-inline">
+              <select id="student-school-id">
+                <option value="">-- Sem escola vinculada / Não possui escola --</option>
+              </select>
+              <button type="button" id="btn-quick-add-school-from-student" class="btn-action-inline" title="Cadastrar uma nova escola">
+                <span>➕ Nova Escola</span>
+              </button>
+            </div>
+            <input type="hidden" id="student-school-name">
           </div>
 
           <div class="form-row">
@@ -3695,5 +3735,86 @@
       </div>
     </div>
 
+
+    <!-- ======================================================== -->
+    <!-- MODAL DO ADMIN: CADASTRAR / EDITAR ESCOLA DE ORIGEM -->
+    <!-- ======================================================== -->
+    <div id="modal-school-admin" role="dialog" aria-modal="true" class="modal-backdrop hidden">
+      <div class="bottom-sheet">
+        <div class="sheet-drag-handle"></div>
+        <div class="sheet-header">
+          <div>
+            <h2 id="school-modal-title">Cadastrar Nova Escola</h2>
+            <span class="sheet-subtitle">Dados de identificação da escola de origem dos estudantes</span>
+          </div>
+          <button type="button" id="btn-close-school-modal" class="btn-close" aria-label="Fechar">✕</button>
+        </div>
+        <form id="form-school-admin" class="sheet-body">
+          <input type="hidden" id="school-edit-id">
+
+          <div class="form-group">
+            <label for="school-name">Nome da Escola / Colégio *</label>
+            <input type="text" id="school-name" required placeholder="Ex: E.E.B. Henrique da Silva Fontes">
+          </div>
+
+          <div class="form-row">
+            <div class="form-group flex-1">
+              <label for="school-type">Rede / Tipo de Ensino</label>
+              <select id="school-type">
+                <option value="estadual">🏛️ Rede Estadual</option>
+                <option value="municipal">🏫 Rede Municipal</option>
+                <option value="privada">🎓 Rede Particular / Privada</option>
+                <option value="federal">🇧🇷 Rede Federal / IF</option>
+                <option value="outra">📌 Outra Instituição</option>
+              </select>
+            </div>
+            <div class="form-group flex-1">
+              <label for="school-city">Cidade / Bairro</label>
+              <input type="text" id="school-city" placeholder="Ex: Itajaí - Centro">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="school-address">Endereço da Escola</label>
+            <input type="text" id="school-address" placeholder="Rua, número, bairro, CEP">
+          </div>
+
+          <div class="form-row">
+            <div class="form-group flex-1">
+              <label for="school-contact-name">Responsável / Contato na Escola</label>
+              <input type="text" id="school-contact-name" placeholder="Ex: Coordenadora Ana / Secretaria">
+            </div>
+            <div class="form-group flex-1">
+              <label for="school-phone">Telefone / WhatsApp</label>
+              <input type="tel" id="school-phone" placeholder="(47) 3333-3333">
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group flex-1">
+              <label for="school-email">E-mail da Escola</label>
+              <input type="email" id="school-email" placeholder="contato@escola.edu.br">
+            </div>
+            <div class="form-group flex-1">
+              <label for="school-status">Status</label>
+              <select id="school-status">
+                <option value="ativo" selected>Ativa</option>
+                <option value="inativo">Inativa</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="school-notes">Observações</label>
+            <textarea id="school-notes" rows="2" placeholder="Informações adicionais, horários de atendimento da coordenação..."></textarea>
+          </div>
+
+          <div class="sheet-actions">
+            <button type="button" class="btn-cancel" id="btn-cancel-school">Cancelar</button>
+            <button type="submit" class="btn-submit" id="btn-save-school">Salvar Escola</button>
+          </div>
+        </form>
+      </div>
+    </div>
   </body>
 </html>
