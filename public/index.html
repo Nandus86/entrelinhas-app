@@ -684,6 +684,11 @@
               <span class="tab-icon">📥</span>
               <span class="tab-label">Leads</span>
             </button>
+            <button class="nav-tab" data-view="view-helpdesk" id="nav-tab-helpdesk-admin">
+              <span class="tab-icon">🎧</span>
+              <span class="tab-label">Help Desk</span>
+              <span class="badge-unread hidden" id="nav-badge-helpdesk-admin" data-hd-badge="admin">0</span>
+            </button>
             <button class="nav-tab" data-view="view-admin">
               <span class="tab-icon">⚙️</span>
               <span class="tab-label">Gestão</span>
@@ -716,6 +721,11 @@
               <span class="tab-icon">📝</span>
               <span class="tab-label">Tarefas</span>
             </button>
+            <button class="nav-tab" data-view="view-helpdesk" id="nav-tab-helpdesk-teacher">
+              <span class="tab-icon">🎧</span>
+              <span class="tab-label">Atendimento</span>
+              <span class="badge-unread hidden" id="nav-badge-helpdesk-teacher" data-hd-badge="teacher">0</span>
+            </button>
           </nav>
 
           <!-- Desktop Navigation Bar: Pais e Responsáveis -->
@@ -744,9 +754,10 @@
               <span class="tab-icon">🕒</span>
               <span class="tab-label">Horários</span>
             </button>
-            <button class="nav-tab" data-parent-subtab="parent-tab-contact">
-              <span class="tab-icon">📞</span>
-              <span class="tab-label">Contato</span>
+            <button class="nav-tab" data-parent-subtab="parent-tab-contact" id="nav-tab-helpdesk-parent">
+              <span class="tab-icon">💬</span>
+              <span class="tab-label">Atendimento</span>
+              <span class="badge-unread hidden" id="nav-badge-helpdesk-parent" data-hd-badge="parent">0</span>
             </button>
           </nav>
           
@@ -898,6 +909,13 @@
                 <div>
                   <strong>Escolas de Origem</strong>
                   <small>Colégios dos estudantes</small>
+                </div>
+              </button>
+              <button class="shortcut-btn" id="btn-quick-open-helpdesk" onclick="switchView('view-helpdesk')">
+                <span class="shortcut-icon">🎧</span>
+                <div>
+                  <strong>Help Desk & Chat</strong>
+                  <small>Atendimento a pais e suporte</small>
                 </div>
               </button>
             </div>
@@ -1560,7 +1578,8 @@
               <span>🕒 Horário de Aulas</span>
             </button>
             <button class="parent-subtab" data-subview="parent-tab-contact" id="btn-parent-subtab-contact">
-              <span>📞 Fale com a Escola</span>
+              <span>💬 Atendimento & Help Desk</span>
+              <span class="badge-unread hidden" id="parent-hd-unread-count" data-hd-badge="parent">0</span>
             </button>
           </div>
 
@@ -1634,13 +1653,85 @@
             </div>
           </div>
 
-          <!-- SUBVIEW 4: FALE COM A ESCOLA -->
+          <!-- SUBVIEW 4: CENTRAL DE CONVERSAS & HELP DESK DA FAMÍLIA -->
           <div id="parent-tab-contact" class="parent-subview-content hidden">
-            <div class="parent-contact-card">
+            <div class="parent-hd-section">
+              <div class="parent-hd-top-bar">
+                <div>
+                  <h3>💬 Central de Conversas & Help Desk</h3>
+                  <p class="text-sm text-muted">Converse com a Coordenação, Professores, Secretaria ou Financeiro e acompanhe o protocolo de cada solicitação.</p>
+                </div>
+                <button type="button" id="btn-parent-new-ticket" class="btn-primary-action">
+                  <span>➕ Nova Conversa / Chamado</span>
+                </button>
+              </div>
+
+              <!-- Workspace Split-View do Portal da Família -->
+              <div class="parent-hd-workspace" id="parent-hd-workspace">
+                <!-- Coluna Esquerda: Lista de Conversas da Família -->
+                <div class="parent-hd-list-col" id="parent-hd-list-col">
+                  <div class="parent-hd-list-header">
+                    <span>📋 Minhas Conversas e Protocolos</span>
+                    <span class="hd-list-counter" id="parent-hd-tickets-count">0</span>
+                  </div>
+                  <div id="parent-hd-tickets-list" class="hd-tickets-list">
+                    <div class="hd-empty-list">Nenhuma conversa iniciada ainda. Clique em "Nova Conversa / Chamado" para falar com a escola.</div>
+                  </div>
+                </div>
+
+                <!-- Coluna Direita: Chat da Conversa Selecionada -->
+                <div class="parent-hd-detail-col" id="parent-hd-chat-box">
+                  <!-- Estado vazio -->
+                  <div id="parent-hd-empty" class="hd-empty-detail">
+                    <span class="hd-empty-icon">💬</span>
+                    <h4>Selecione uma conversa ao lado</h4>
+                    <p class="text-sm text-muted">Escolha um atendimento na lista ou abra um novo chamado para conversar com nossa equipe.</p>
+                  </div>
+
+                  <!-- Conversa ativa -->
+                  <div id="parent-hd-active" class="hd-active-detail hidden">
+                    <div class="hd-detail-header" id="parent-hd-header">
+                      <div class="hd-detail-header-top">
+                        <button type="button" class="btn-hd-back-mobile" id="btn-parent-hd-back">← Voltar</button>
+                        <span class="hd-protocol-badge" id="parent-hd-protocol">#HD-000000-0000</span>
+                        <span class="hd-status-badge" id="parent-hd-status">Aguardando</span>
+                        <span class="hd-urgency-badge" id="parent-hd-urgency">Normal</span>
+                        <div class="hd-detail-actions" style="margin-left:auto;">
+                          <button type="button" class="btn-hd-action btn-hd-close" id="btn-parent-close-ticket" title="Marcar atendimento como resolvido">✅ Concluir</button>
+                          <button type="button" class="btn-hd-action btn-hd-reopen hidden" id="btn-parent-reopen-ticket" title="Reabrir conversa">🔄 Reabrir</button>
+                        </div>
+                      </div>
+                      <h4 class="hd-detail-subject" id="parent-hd-subject">Assunto da Conversa</h4>
+                      <div class="hd-detail-meta" id="parent-hd-meta">
+                        <span id="parent-hd-meta-queue">📁 Setor: Coordenação</span>
+                        <span id="parent-hd-meta-student">🎓 Aluno: —</span>
+                        <span id="parent-hd-meta-attendant">👤 Atendente: Aguardando</span>
+                      </div>
+                    </div>
+
+                    <!-- Histórico de Mensagens (Estilo WhatsApp) -->
+                    <div id="parent-hd-messages" class="hd-messages-container">
+                      <!-- Bolhas de mensagens renderizadas via JS -->
+                    </div>
+
+                    <!-- Barra de Envio de Mensagem -->
+                    <form id="form-parent-hd-message" class="hd-composer-form">
+                      <textarea id="parent-hd-input" rows="2" placeholder="Digite sua mensagem para a escola..." required></textarea>
+                      <button type="submit" id="btn-parent-hd-send" class="btn-hd-send">
+                        <span>Enviar ➤</span>
+                      </button>
+                    </form>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Canais Diretos Institucionais -->
+            <div class="parent-contact-card" style="margin-top: 20px;">
               <div class="contact-card-header">
                 <img src="img/logo-entrelinhas-dark.svg" alt="Entrelinhas" style="height: 44px; width: auto; margin-bottom: 12px;">
-                <h3>Estamos Sempre Conectados com a Sua Família</h3>
-                <p class="text-sm text-muted">Dúvidas pedagógicas, justificativas de faltas ou recados para os professores podem ser enviados diretamente para nossa equipe.</p>
+                <h3>Canais Diretos & Unidade Presencial</h3>
+                <p class="text-sm text-muted">Além da Central de Atendimento acima, você também pode falar conosco pelos canais institucionais abaixo.</p>
               </div>
 
               <div class="contact-channels-grid">
@@ -2155,6 +2246,210 @@
           </div>
         </section>
 
+        <!-- ======================================================== -->
+        <!-- VIEW: CENTRAL DE ATENDIMENTO, CONVERSAS & HELP DESK      -->
+        <!-- ======================================================== -->
+        <section id="view-helpdesk" class="view-panel">
+          <div class="hd-page-header">
+            <div class="hd-page-title-block">
+              <h2>🎧 Central de Atendimento & Help Desk</h2>
+              <p class="text-sm text-muted">Conversas unificadas com famílias e alunos, fila de suporte e projetos internos com controle de SLA e auditoria.</p>
+            </div>
+            <div class="hd-page-actions">
+              <button type="button" id="btn-hd-manage-queues" class="btn-secondary-action admin-only">
+                <span>⚙️ Filas & SLAs</span>
+              </button>
+              <button type="button" id="btn-hd-new-ticket" class="btn-primary-action">
+                <span>➕ Novo Chamado / Conversa</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- KPI Strip -->
+          <div class="hd-kpi-strip" id="hd-kpi-strip">
+            <div class="hd-kpi-card kpi-waiting">
+              <div class="hd-kpi-icon">⏳</div>
+              <div class="hd-kpi-info">
+                <span class="hd-kpi-value" id="hd-kpi-waiting">0</span>
+                <span class="hd-kpi-label">Na Fila (Aguardando)</span>
+              </div>
+            </div>
+            <div class="hd-kpi-card kpi-progress">
+              <div class="hd-kpi-icon">💬</div>
+              <div class="hd-kpi-info">
+                <span class="hd-kpi-value" id="hd-kpi-in-progress">0</span>
+                <span class="hd-kpi-label">Em Atendimento</span>
+              </div>
+            </div>
+            <div class="hd-kpi-card kpi-transferred">
+              <div class="hd-kpi-icon">🔀</div>
+              <div class="hd-kpi-info">
+                <span class="hd-kpi-value" id="hd-kpi-transferred">0</span>
+                <span class="hd-kpi-label">Transferidos</span>
+              </div>
+            </div>
+            <div class="hd-kpi-card kpi-overdue">
+              <div class="hd-kpi-icon">🚨</div>
+              <div class="hd-kpi-info">
+                <span class="hd-kpi-value" id="hd-kpi-sla-overdue">0</span>
+                <span class="hd-kpi-label">SLA em Alerta / Vencido</span>
+              </div>
+            </div>
+            <div class="hd-kpi-card kpi-closed">
+              <div class="hd-kpi-icon">✅</div>
+              <div class="hd-kpi-info">
+                <span class="hd-kpi-value" id="hd-kpi-closed">0</span>
+                <span class="hd-kpi-label">Concluídos</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Barra de Filtros & Escopo -->
+          <div class="hd-toolbar">
+            <div class="hd-scope-pills" id="hd-scope-pills">
+              <button type="button" class="hd-scope-pill active" data-scope="">📋 Todos</button>
+              <button type="button" class="hd-scope-pill" data-scope="familia">👨‍👩‍👧 Famílias & Alunos</button>
+              <button type="button" class="hd-scope-pill" data-scope="interno">🛠️ Suporte & Projetos Internos</button>
+            </div>
+
+            <div class="hd-filters-row">
+              <div class="hd-filter-item">
+                <select id="hd-filter-status" aria-label="Filtrar por status">
+                  <option value="">Todos os Status (Abertos + Concluídos)</option>
+                  <option value="OPEN_ALL">Somente em Aberto (Fila + Atendimento)</option>
+                  <option value="WAITING">⏳ Aguardando Atendimento</option>
+                  <option value="IN_PROGRESS">💬 Em Atendimento</option>
+                  <option value="TRANSFERRED">🔀 Transferidos</option>
+                  <option value="CLOSED">✅ Concluídos / Encerrados</option>
+                </select>
+              </div>
+              <div class="hd-filter-item">
+                <select id="hd-filter-queue" aria-label="Filtrar por fila ou setor">
+                  <option value="">Todas as Filas / Setores</option>
+                </select>
+              </div>
+              <div class="hd-filter-item">
+                <select id="hd-filter-urgency" aria-label="Filtrar por urgência">
+                  <option value="">Todas as Urgências</option>
+                  <option value="5">🔴 5 - Crítica</option>
+                  <option value="4">🟠 4 - Alta</option>
+                  <option value="3">🟡 3 - Normal</option>
+                  <option value="2">🔵 2 - Baixa</option>
+                  <option value="1">⚪ 1 - Mínima</option>
+                </select>
+              </div>
+              <div class="hd-filter-item hd-filter-search">
+                <input type="search" id="hd-search-input" placeholder="🔍 Buscar por protocolo, assunto, aluno ou responsável...">
+              </div>
+            </div>
+          </div>
+
+          <!-- Split-View Workspace (Lista à Esquerda + Painel de Conversa à Direita) -->
+          <div class="hd-workspace" id="hd-workspace">
+            <!-- Coluna Esquerda: Lista de Chamados / Conversas -->
+            <div class="hd-list-col" id="hd-list-col">
+              <div class="hd-list-col-header">
+                <span>Caixa de Entrada</span>
+                <span class="hd-list-counter" id="hd-tickets-count">0</span>
+              </div>
+              <div id="hd-tickets-list" class="hd-tickets-list">
+                <div class="hd-empty-list">Carregando atendimentos...</div>
+              </div>
+            </div>
+
+            <!-- Coluna Direita: Detalhes do Chamado, Chat, Notas Internas e Auditoria -->
+            <div class="hd-detail-col" id="hd-detail-col">
+              <!-- Placeholder quando nenhum chamado está selecionado -->
+              <div id="hd-empty-detail" class="hd-empty-detail">
+                <span class="hd-empty-icon">🎧</span>
+                <h3>Selecione um chamado ou conversa</h3>
+                <p class="text-sm text-muted">Clique em um atendimento na coluna à esquerda para visualizar o histórico de mensagens, notas internas e linha do tempo de auditoria.</p>
+              </div>
+
+              <!-- Painel ativo quando um chamado está aberto -->
+              <div id="hd-active-detail" class="hd-active-detail hidden">
+                <!-- Cabeçalho do Chamado -->
+                <div class="hd-detail-header" id="hd-detail-header">
+                  <div class="hd-detail-header-top">
+                    <button type="button" class="btn-hd-back-mobile" id="btn-hd-back-list">← Lista</button>
+                    <span class="hd-protocol-badge" id="hd-det-protocol">#HD-000000-0000</span>
+                    <span class="hd-scope-badge" id="hd-det-scope">Família</span>
+                    <span class="hd-status-badge" id="hd-det-status">WAITING</span>
+                    <span class="hd-urgency-badge" id="hd-det-urgency">Normal</span>
+                    <span class="hd-sla-badge" id="hd-det-sla">SLA OK</span>
+
+                    <div class="hd-detail-actions">
+                      <button type="button" class="btn-hd-action btn-hd-claim" id="btn-hd-claim" title="Assumir este atendimento">✋ Assumir</button>
+                      <button type="button" class="btn-hd-action btn-hd-transfer" id="btn-hd-transfer" title="Transferir para outra fila ou professor">🔀 Transferir</button>
+                      <button type="button" class="btn-hd-action btn-hd-close" id="btn-hd-close" title="Encerrar / concluir chamado">✅ Encerrar</button>
+                      <button type="button" class="btn-hd-action btn-hd-reopen hidden" id="btn-hd-reopen" title="Reabrir chamado">🔄 Reabrir</button>
+                    </div>
+                  </div>
+
+                  <h3 class="hd-detail-subject" id="hd-det-subject">Assunto do Chamado</h3>
+
+                  <div class="hd-detail-meta" id="hd-det-meta">
+                    <span id="hd-det-meta-queue">📁 Fila: —</span>
+                    <span id="hd-det-meta-student">🎓 Aluno: —</span>
+                    <span id="hd-det-meta-requester">👤 Solicitante: —</span>
+                    <span id="hd-det-meta-attendant">🎧 Atendente: —</span>
+                  </div>
+                </div>
+
+                <!-- Sub-Abas do Painel de Detalhes -->
+                <div class="hd-detail-tabs" id="hd-detail-tabs">
+                  <button type="button" class="hd-detail-tab active" data-hdtab="chat" id="btn-hd-tab-chat">
+                    <span>💬 Chat da Conversa</span>
+                  </button>
+                  <button type="button" class="hd-detail-tab staff-only" data-hdtab="notes" id="btn-hd-tab-notes">
+                    <span>🔒 Notas Internas</span>
+                    <span class="hd-tab-counter" id="hd-notes-count">0</span>
+                  </button>
+                  <button type="button" class="hd-detail-tab" data-hdtab="events" id="btn-hd-tab-events">
+                    <span>🕒 Linha do Tempo / Auditoria</span>
+                  </button>
+                </div>
+
+                <!-- ABA 1: CHAT DA CONVERSA -->
+                <div id="hd-tab-chat" class="hd-tab-panel active">
+                  <div id="hd-messages-container" class="hd-messages-container">
+                    <!-- Mensagens renderizadas via JS -->
+                  </div>
+                  <form id="form-hd-send-message" class="hd-composer-form">
+                    <textarea id="hd-message-input" rows="2" placeholder="Escreva uma resposta para o solicitante (Enter para enviar com Shift+Enter para quebrar linha)..." required></textarea>
+                    <button type="submit" id="btn-hd-send-msg" class="btn-hd-send">
+                      <span>Enviar ➤</span>
+                    </button>
+                  </form>
+                </div>
+
+                <!-- ABA 2: NOTAS INTERNAS (CONFIDENCIAL DA EQUIPE) -->
+                <div id="hd-tab-notes" class="hd-tab-panel hidden">
+                  <div class="hd-internal-warning">
+                    🔒 <strong>Área Confidencial da Equipe:</strong> As anotações abaixo são visíveis apenas para Coordenação e Professores (nunca aparecem no Portal dos Pais).
+                  </div>
+                  <div id="hd-notes-list" class="hd-notes-list">
+                    <!-- Notas internas renderizadas via JS -->
+                  </div>
+                  <form id="form-hd-add-note" class="hd-composer-form hd-note-composer">
+                    <textarea id="hd-note-input" rows="2" placeholder="Adicionar nota interna confidencial sobre este caso..." required></textarea>
+                    <button type="submit" id="btn-hd-save-note" class="btn-hd-send btn-hd-note-btn">
+                      <span>🔒 Salvar Nota</span>
+                    </button>
+                  </form>
+                </div>
+
+                <!-- ABA 3: LINHA DO TEMPO / EVENTOS DE AUDITORIA -->
+                <div id="hd-tab-events" class="hd-tab-panel hidden">
+                  <div id="hd-events-timeline" class="hd-events-timeline">
+                    <!-- Linha do tempo renderizada via JS -->
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
       </main>
 
       <!-- Bottom Navigation Bar: Administrador -->
@@ -2191,6 +2486,11 @@
           <span class="tab-icon">📥</span>
           <span class="tab-label">Leads</span>
         </button>
+        <button class="nav-tab" data-view="view-helpdesk" id="bottom-nav-tab-helpdesk-admin">
+          <span class="tab-icon">🎧</span>
+          <span class="tab-label">Help Desk</span>
+          <span class="badge-unread hidden" id="nav-badge-helpdesk-admin-mobile" data-hd-badge="admin">0</span>
+        </button>
         <button class="nav-tab" data-view="view-admin">
           <span class="tab-icon">⚙️</span>
           <span class="tab-label">Gestão</span>
@@ -2218,6 +2518,11 @@
         <button class="nav-tab" data-view="view-reports">
           <span class="tab-icon">📑</span>
           <span class="tab-label">Relatórios</span>
+        </button>
+        <button class="nav-tab" data-view="view-helpdesk" id="bottom-nav-tab-helpdesk-teacher">
+          <span class="tab-icon">🎧</span>
+          <span class="tab-label">Atendimento</span>
+          <span class="badge-unread hidden" id="nav-badge-helpdesk-teacher-mobile" data-hd-badge="teacher">0</span>
         </button>
       </nav>
 
@@ -2247,9 +2552,10 @@
           <span class="tab-icon">🕒</span>
           <span class="tab-label">Horários</span>
         </button>
-        <button class="nav-tab" data-parent-subtab="parent-tab-contact">
-          <span class="tab-icon">📞</span>
-          <span class="tab-label">Contato</span>
+        <button class="nav-tab" data-parent-subtab="parent-tab-contact" id="bottom-nav-tab-helpdesk-parent">
+          <span class="tab-icon">💬</span>
+          <span class="tab-label">Atendimento</span>
+          <span class="badge-unread hidden" id="nav-badge-helpdesk-parent-mobile" data-hd-badge="parent">0</span>
         </button>
       </nav>
     </div>
@@ -3814,6 +4120,243 @@
             <button type="submit" class="btn-submit" id="btn-save-school">Salvar Escola</button>
           </div>
         </form>
+      </div>
+    </div>
+
+    <!-- ======================================================== -->
+    <!-- MODAL: NOVO CHAMADO / NOVA CONVERSA (HELP DESK)          -->
+    <!-- ======================================================== -->
+    <div id="modal-hd-new-ticket" role="dialog" aria-modal="true" class="modal-backdrop hidden">
+      <div class="bottom-sheet" style="max-width: 640px;">
+        <div class="sheet-drag-handle"></div>
+        <div class="sheet-header">
+          <h2 id="modal-hd-new-title">➕ Novo Chamado / Conversa</h2>
+          <button type="button" class="btn-close-sheet" id="btn-close-hd-new-modal" aria-label="Fechar">✕</button>
+        </div>
+        <form id="form-hd-new-ticket" class="sheet-form">
+          <div class="form-row" id="hd-new-scope-group">
+            <div class="form-group flex-1">
+              <label for="hd-new-scope">Natureza do Atendimento *</label>
+              <select id="hd-new-scope" required>
+                <option value="familia" selected>👨‍👩‍👧 Conversa / Atendimento com Família & Aluno</option>
+                <option value="interno">🛠️ Chamado Interno (Suporte Técnico / Projetos / Equipe)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group flex-1" id="hd-new-student-group">
+              <label for="hd-new-student">Aluno Vinculado</label>
+              <select id="hd-new-student">
+                <option value="">— Selecione o aluno (opcional para interno) —</option>
+              </select>
+            </div>
+            <div class="form-group flex-1">
+              <label for="hd-new-service-type">Setor / Fila de Atendimento *</label>
+              <select id="hd-new-service-type" required>
+                <option value="">Selecione o setor...</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group flex-1" id="hd-new-teacher-group">
+              <label for="hd-new-teacher">Direcionar a Professor / Atendente (Opcional)</label>
+              <select id="hd-new-teacher">
+                <option value="">— Fila geral do setor —</option>
+              </select>
+            </div>
+            <div class="form-group flex-1" id="hd-new-urgency-group">
+              <label for="hd-new-urgency">Nível de Urgência</label>
+              <select id="hd-new-urgency">
+                <option value="1">⚪ 1 - Mínima</option>
+                <option value="2">🔵 2 - Baixa</option>
+                <option value="3" selected>🟡 3 - Normal</option>
+                <option value="4">🟠 4 - Alta</option>
+                <option value="5">🔴 5 - Crítica / Urgente</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="hd-new-subject">Assunto / Título *</label>
+            <input type="text" id="hd-new-subject" placeholder="Ex: Dúvida sobre tarefa de Matemática, Reagendamento de aula, Suporte EAD..." required maxlength="180">
+          </div>
+
+          <div class="form-group">
+            <label for="hd-new-body">Mensagem Inicial / Descrição *</label>
+            <textarea id="hd-new-body" rows="4" placeholder="Descreva sua solicitação ou mensagem com detalhes..." required></textarea>
+          </div>
+
+          <div class="sheet-actions">
+            <button type="button" class="btn-cancel" id="btn-cancel-hd-new">Cancelar</button>
+            <button type="submit" class="btn-submit" id="btn-submit-hd-new">📨 Abrir Atendimento</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- ======================================================== -->
+    <!-- MODAL: TRANSFERIR CHAMADO DE FILA / ATENDENTE            -->
+    <!-- ======================================================== -->
+    <div id="modal-hd-transfer" role="dialog" aria-modal="true" class="modal-backdrop hidden">
+      <div class="bottom-sheet" style="max-width: 540px;">
+        <div class="sheet-drag-handle"></div>
+        <div class="sheet-header">
+          <h2>🔀 Transferir Atendimento</h2>
+          <button type="button" class="btn-close-sheet" id="btn-close-hd-transfer-modal" aria-label="Fechar">✕</button>
+        </div>
+        <form id="form-hd-transfer" class="sheet-form">
+          <input type="hidden" id="hd-transfer-ticket-id">
+
+          <div class="form-group">
+            <label for="hd-transfer-queue">Nova Fila / Setor de Destino *</label>
+            <select id="hd-transfer-queue" required>
+              <option value="">Selecione a fila de destino...</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="hd-transfer-user">Atribuir a Professor / Atendente Específico (Opcional)</label>
+            <select id="hd-transfer-user">
+              <option value="">— Deixar aguardando na fila do setor —</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="hd-transfer-reason">Motivo / Observação da Transferência *</label>
+            <textarea id="hd-transfer-reason" rows="3" placeholder="Explique brevemente o motivo do encaminhamento para orientar o próximo atendente..." required></textarea>
+          </div>
+
+          <div class="sheet-actions">
+            <button type="button" class="btn-cancel" id="btn-cancel-hd-transfer">Cancelar</button>
+            <button type="submit" class="btn-submit" id="btn-submit-hd-transfer">🔀 Confirmar Transferência</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- ======================================================== -->
+    <!-- MODAL: ENCERRAR / CONCLUIR CHAMADO                       -->
+    <!-- ======================================================== -->
+    <div id="modal-hd-close" role="dialog" aria-modal="true" class="modal-backdrop hidden">
+      <div class="bottom-sheet" style="max-width: 520px;">
+        <div class="sheet-drag-handle"></div>
+        <div class="sheet-header">
+          <h2>✅ Encerrar Atendimento</h2>
+          <button type="button" class="btn-close-sheet" id="btn-close-hd-close-modal" aria-label="Fechar">✕</button>
+        </div>
+        <form id="form-hd-close" class="sheet-form">
+          <input type="hidden" id="hd-close-ticket-id">
+
+          <div class="form-group">
+            <label for="hd-close-type">Resultado do Atendimento *</label>
+            <select id="hd-close-type" required>
+              <option value="RESOLVED" selected>✅ Resolvido / Concluído com Sucesso</option>
+              <option value="NOT_RESOLVED">⚠️ Encerrado sem Resolução / Cancelado</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="hd-close-summary">Resumo da Solução / Mensagem de Fechamento</label>
+            <textarea id="hd-close-summary" rows="3" placeholder="Opcional: registre o desfecho ou mensagem final deste protocolo..."></textarea>
+          </div>
+
+          <div class="sheet-actions">
+            <button type="button" class="btn-cancel" id="btn-cancel-hd-close">Cancelar</button>
+            <button type="submit" class="btn-submit" id="btn-submit-hd-close">✅ Confirmar Encerramento</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- ======================================================== -->
+    <!-- MODAL: GERENCIAR FILAS, SETORES & SLAs (ADMIN)           -->
+    <!-- ======================================================== -->
+    <div id="modal-hd-queues" role="dialog" aria-modal="true" class="modal-backdrop hidden">
+      <div class="bottom-sheet" style="max-width: 820px;">
+        <div class="sheet-drag-handle"></div>
+        <div class="sheet-header">
+          <h2>⚙️ Configurar Filas de Atendimento & SLAs</h2>
+          <button type="button" class="btn-close-sheet" id="btn-close-hd-queues-modal" aria-label="Fechar">✕</button>
+        </div>
+        <div class="sheet-form">
+          <p class="text-sm text-muted" style="margin-bottom: 12px;">Gerencie os setores de atendimento, tempos de resposta alvo (SLA em minutos), mensagens automáticas de boas-vindas e visibilidade para as famílias.</p>
+
+          <!-- Lista de filas existentes -->
+          <div id="hd-queues-list" class="hd-queues-list">
+            <!-- Filas renderizadas via JS -->
+          </div>
+
+          <!-- Formulário para criar/editar fila -->
+          <form id="form-hd-queue" class="hd-queue-form-box">
+            <h4 id="hd-queue-form-title">➕ Nova Fila / Editar Fila</h4>
+            <input type="hidden" id="hd-queue-edit-id">
+
+            <div class="form-row">
+              <div class="form-group flex-1">
+                <label for="hd-queue-code">Código Único *</label>
+                <input type="text" id="hd-queue-code" placeholder="Ex: PEDAGOGICO, FINANCEIRO" required maxlength="40">
+              </div>
+              <div class="form-group flex-1">
+                <label for="hd-queue-name">Nome de Exibição *</label>
+                <input type="text" id="hd-queue-name" placeholder="Ex: 📚 Pedagógico & Professores" required maxlength="80">
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group flex-1">
+                <label for="hd-queue-sla">SLA Alvo ( em minutos ) *</label>
+                <input type="number" id="hd-queue-sla" min="5" max="10080" value="240" required>
+              </div>
+              <div class="form-group flex-1">
+                <label for="hd-queue-urgency">Urgência Padrão (1-5)</label>
+                <select id="hd-queue-urgency">
+                  <option value="1">1 - Mínima</option>
+                  <option value="2">2 - Baixa</option>
+                  <option value="3" selected>3 - Normal</option>
+                  <option value="4">4 - Alta</option>
+                  <option value="5">5 - Crítica</option>
+                </select>
+              </div>
+              <div class="form-group flex-1">
+                <label for="hd-queue-target-role">Público / Papel Alvo</label>
+                <select id="hd-queue-target-role">
+                  <option value="coordenacao" selected>Coordenação / Secretaria</option>
+                  <option value="professor">Professores & Pedagógico</option>
+                  <option value="admin">Somente Admin / TI Interno</option>
+                  <option value="all">Todos (Famílias + Equipe)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="form-row" style="gap: 16px; margin-bottom: 10px;">
+              <label class="checkbox-inline" style="display:flex; align-items:center; gap:6px; font-size:0.88rem; cursor:pointer;">
+                <input type="checkbox" id="hd-queue-restricted">
+                <span>🔒 Fila Interna Restrita (oculta para Pais/Alunos)</span>
+              </label>
+              <label class="checkbox-inline" style="display:flex; align-items:center; gap:6px; font-size:0.88rem; cursor:pointer;">
+                <input type="checkbox" id="hd-queue-active" checked>
+                <span>✅ Fila Ativa</span>
+              </label>
+            </div>
+
+            <div class="form-group">
+              <label for="hd-queue-description">Descrição Curta do Setor</label>
+              <input type="text" id="hd-queue-description" placeholder="Ex: Dúvidas sobre aulas, tarefas, avaliações e acompanhamento pedagógico">
+            </div>
+
+            <div class="form-group">
+              <label for="hd-queue-welcome">Mensagem Automática de Boas-Vindas (Bot)</label>
+              <textarea id="hd-queue-welcome" rows="2" placeholder="Mensagem enviada automaticamente ao abrir um chamado nesta fila..."></textarea>
+            </div>
+
+            <div class="sheet-actions">
+              <button type="button" class="btn-cancel" id="btn-hd-queue-reset">Limpar / Novo</button>
+              <button type="submit" class="btn-submit" id="btn-hd-queue-save">💾 Salvar Fila</button>
+            </div>
+          </form>
+        </div>
       </div>
     </div>
   </body>

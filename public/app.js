@@ -234,6 +234,7 @@ document.addEventListener('DOMContentLoaded', () => {
   setInterval(() => {
     if (state.token) {
       loadStats();
+      loadHelpdeskStats();
     }
   }, 30000);
 });
@@ -644,6 +645,9 @@ function switchView(viewId) {
   if (viewId === 'view-admin-leads') {
     loadAdminLeads();
   }
+  if (viewId === 'view-helpdesk') {
+    initHelpdeskView();
+  }
 }
 
 // ==========================================
@@ -656,7 +660,8 @@ async function loadAllData() {
     loadSubjects(),
     loadStudents(),
     loadStats(),
-    loadSchedules()
+    loadSchedules(),
+    loadHelpdeskStats()
   ]);
 }
 
@@ -4919,6 +4924,9 @@ async function loadParentPortalData(overrideStudentId = null) {
     await loadParentAgenda(overrideStudentId || (data.student ? data.student.id : null));
     await loadParentClasses(overrideStudentId || (data.student ? data.student.id : null));
     await loadParentReport(overrideStudentId || (data.student ? data.student.id : null));
+    loadParentFamilyMessages();
+    loadHelpdeskStats();
+    loadParentHelpdeskTickets();
   } catch (err) {
     console.error('Erro ao carregar portal dos pais:', err);
     showToast('Não foi possível carregar todas as informações do portal.');
@@ -5346,6 +5354,8 @@ function switchParentSubtab(subtabId) {
     loadStudentOnlineClasses();
   } else if (subtabId === 'parent-tab-finance') {
     loadStudentInvoices();
+  } else if (subtabId === 'parent-tab-contact') {
+    loadParentHelpdeskTickets();
   }
 }
 
@@ -9237,7 +9247,13 @@ async function submitFamilyReply(form) {
 
 function setupFamilyMessaging() {
   const open = document.getElementById('btn-open-family-msg');
-  if (open) open.addEventListener('click', openFamilyMessageModal);
+  if (open) open.addEventListener('click', () => {
+    if (typeof openHdNewTicketModal === 'function') {
+      openHdNewTicketModal('familia');
+    } else {
+      openFamilyMessageModal();
+    }
+  });
 
   const form = document.getElementById('form-family-msg');
   if (form) form.addEventListener('submit', submitFamilyMessage);
@@ -9275,14 +9291,16 @@ function familyAlertCard(items, scope) {
       : `Prof. ${escapeHtml(m.teacher_name || '-')}`;
     const preview = m.body.length > 90 ? m.body.slice(0, 90) + '…' : m.body;
     const newBadge = m.status === 'nova' ? '<span class="fm-status fm-status-new">Nova</span>' : '';
+    const protoBadge = m.protocol ? `<span class="hd-protocol-badge" style="font-size:0.7rem; padding:1px 6px; margin-right:4px;">#${escapeHtml(m.protocol)}</span>` : '';
+    const ticketAttr = (m.ticket_id || m.id) ? `data-hd-open-ticket="${m.ticket_id || m.id}"` : '';
     return `
       <li class="family-alert-item">
         <div>
-          <strong>${escapeHtml(m.student_name)}</strong>
+          <strong>${protoBadge}${escapeHtml(m.student_name)}</strong>
           <small class="text-muted">${dest} · ${escapeHtml(m.created_at_br || '')} ${newBadge}</small>
           <span class="family-alert-preview">“${escapeHtml(preview)}”</span>
         </div>
-        <button type="button" class="btn-card-action primary" data-fm-open="${m.student_id}">Responder</button>
+        <button type="button" class="btn-card-action primary" data-fm-open="${m.student_id}" ${ticketAttr}>Responder</button>
       </li>`;
   }).join('');
   return `
@@ -9329,10 +9347,15 @@ async function appendAdminFamilyAlerts() {
 }
 
 function setupFamilyAlerts() {
-  // Botão "Responder" dos avisos: abre a agenda do aluno, onde está a mensagem
+  // Botão "Responder" dos avisos: abre diretamente o chamado no Help Desk se houver ticket_id, ou a agenda do aluno
   document.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-fm-open]');
     if (!btn) return;
+    const hdTicketId = btn.getAttribute('data-hd-open-ticket');
+    if (hdTicketId && typeof openHelpdeskTicketDirect === 'function') {
+      openHelpdeskTicketDirect(hdTicketId);
+      return;
+    }
     openStudentAgendaModal(btn.getAttribute('data-fm-open'));
   });
 }
@@ -10677,4 +10700,1542 @@ function bindSchoolsEventsOnce() {
 
 document.addEventListener('DOMContentLoaded', () => {
   bindSchoolsEventsOnce();
+  bindHelpdeskEventsOnce();
 });
+
+// ============================================================================
+// 🎧 MÓDULO UNIFICADO: HELP DESK & CENTRAL DE CONVERSAS (ESCOLA ↔ PAIS + EQUIPE)
+// ============================================================================
+
+state.hdServiceTypes = [];
+state.hdTickets = [];
+state.hdActiveTicketId = null;
+state.hdActiveTicketDetail = null;
+state.hdFilterScope = '';
+state.hdFilterStatus = '';
+state.hdFilterQueue = '';
+state.hdFilterUrgency = '';
+state.hdSearchQuery = '';
+state.hdActiveTab = 'chat';
+state.hdEventsBound = false;
+state.parentHdTickets = [];
+state.parentHdActiveTicketId = null;
+state.parentHdActiveDetail = null;
+state.parentActiveSubtab = 'parent-tab-agenda';
+
+// Alias compatível hdState para acesso unificado aos IDs selecionados
+const hdState = {
+  get selectedTicketId() { return state.hdActiveTicketId; },
+  set selectedTicketId(val) { state.hdActiveTicketId = val; },
+  get parentSelectedTicketId() { return state.parentHdActiveTicketId; },
+  set parentSelectedTicketId(val) { state.parentHdActiveTicketId = val; },
+  sseSource: null,
+  sseReconnectTimer: null,
+  sseToken: null,
+  pollTimer: null,
+  refreshInFlight: false
+};
+window.hdState = hdState;
+
+const HD_STATUS_META = {
+  WAITING: { label: '⏳ Aguardando', cls: 'status-WAITING' },
+  IN_PROGRESS: { label: '💬 Em Atendimento', cls: 'status-IN_PROGRESS' },
+  TRANSFERRED: { label: '🔀 Transferido', cls: 'status-TRANSFERRED' },
+  CLOSED: { label: '✅ Concluído', cls: 'status-CLOSED' }
+};
+
+const HD_URGENCY_META = {
+  1: { label: '⚪ 1 - Mínima', cls: 'urgency-1' },
+  2: { label: '🔵 2 - Baixa', cls: 'urgency-2' },
+  3: { label: '🟡 3 - Normal', cls: 'urgency-3' },
+  4: { label: '🟠 4 - Alta', cls: 'urgency-4' },
+  5: { label: '🔴 5 - Crítica', cls: 'urgency-5' }
+};
+
+const HD_EVENT_LABELS = {
+  CREATED: { icon: '🆕', label: 'Chamado aberto' },
+  CLAIM: { icon: '✋', label: 'Atendimento assumido' },
+  TRANSFERRED: { icon: '🔀', label: 'Chamado transferido' },
+  CLOSED: { icon: '✅', label: 'Atendimento encerrado' },
+  REOPENED: { icon: '🔄', label: 'Chamado reaberto' },
+  NOTE_ADDED: { icon: '🔒', label: 'Nota interna registrada' }
+};
+
+async function loadHelpdeskStats() {
+  if (!state.token) return;
+  try {
+    const stats = await apiJson('/api/helpdesk/stats');
+    const setEl = (id, val) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = val || 0;
+    };
+    setEl('hd-kpi-waiting', stats.waiting);
+    setEl('hd-kpi-in-progress', stats.in_progress);
+    setEl('hd-kpi-transferred', stats.transferred);
+    setEl('hd-kpi-sla-overdue', stats.sla_overdue);
+    setEl('hd-kpi-closed', stats.closed);
+
+    const role = state.currentUser && state.currentUser.role;
+    const badgeCount = role === 'responsavel'
+      ? (parseInt(stats.unread) || 0)
+      : ((parseInt(stats.unread) || 0) + (parseInt(stats.waiting) || 0));
+
+    const targetBadgeType = role === 'admin' ? 'admin' : (role === 'professor' ? 'teacher' : 'parent');
+    document.querySelectorAll(`[data-hd-badge="${targetBadgeType}"]`).forEach(b => {
+      b.textContent = badgeCount;
+      b.classList.toggle('hidden', badgeCount <= 0);
+    });
+
+    const parentSubtabBadge = document.getElementById('parent-hd-unread-count');
+    if (parentSubtabBadge && role === 'responsavel') {
+      const unreadParent = parseInt(stats.unread) || 0;
+      parentSubtabBadge.textContent = unreadParent;
+      parentSubtabBadge.classList.toggle('hidden', unreadParent <= 0);
+    }
+  } catch (err) {
+    // Silencioso em background
+  }
+}
+
+async function loadHelpdeskServiceTypes() {
+  try {
+    const rows = await apiJson('/api/helpdesk/service-types');
+    state.hdServiceTypes = Array.isArray(rows) ? rows : [];
+    populateHelpdeskQueueSelects();
+    return state.hdServiceTypes;
+  } catch (err) {
+    console.error('Erro ao carregar filas do Help Desk:', err);
+    return [];
+  }
+}
+
+function populateHelpdeskQueueSelects() {
+  const queues = state.hdServiceTypes || [];
+  const activeQueues = queues.filter(q => q.active !== false);
+
+  const filterSelect = document.getElementById('hd-filter-queue');
+  if (filterSelect) {
+    const current = filterSelect.value;
+    filterSelect.innerHTML = `<option value="">Todas as Filas / Setores</option>` +
+      queues.map(q => `<option value="${q.id}">[${escapeHtml(q.code)}] ${escapeHtml(q.name)}</option>`).join('');
+    filterSelect.value = current;
+  }
+
+  const transferQueue = document.getElementById('hd-transfer-queue');
+  if (transferQueue) {
+    transferQueue.innerHTML = `<option value="">Selecione a fila de destino...</option>` +
+      activeQueues.map(q => `<option value="${q.id}">[${escapeHtml(q.code)}] ${escapeHtml(q.name)}</option>`).join('');
+  }
+}
+
+async function initHelpdeskView() {
+  bindHelpdeskEventsOnce();
+  const manageBtn = document.getElementById('btn-hd-manage-queues');
+  if (manageBtn) {
+    manageBtn.classList.toggle('hidden', !(state.currentUser && state.currentUser.role === 'admin'));
+  }
+  await Promise.all([
+    loadHelpdeskServiceTypes(),
+    loadHelpdeskStats(),
+    loadHelpdeskTickets()
+  ]);
+}
+
+async function openHelpdeskTicketDirect(ticketId) {
+  if (!ticketId) return;
+  state.hdActiveTicketId = Number(ticketId);
+  switchView('view-helpdesk');
+  await selectHdTicket(ticketId);
+}
+window.openHelpdeskTicketDirect = openHelpdeskTicketDirect;
+
+async function loadHelpdeskTickets(silent = false) {
+  const listEl = document.getElementById('hd-tickets-list');
+  const countEl = document.getElementById('hd-tickets-count');
+  if (!listEl) return;
+
+  try {
+    const params = new URLSearchParams();
+    if (state.hdFilterScope) params.set('scope', state.hdFilterScope);
+    if (state.hdFilterStatus && state.hdFilterStatus !== 'OPEN_ALL') {
+      params.set('status', state.hdFilterStatus);
+    }
+    if (state.hdFilterQueue) params.set('service_type_id', state.hdFilterQueue);
+    if (state.hdFilterUrgency) params.set('urgency', state.hdFilterUrgency);
+    if (state.hdSearchQuery) params.set('search', state.hdSearchQuery);
+
+    let rows = await apiJson(`/api/helpdesk/tickets?${params.toString()}`);
+    if (!Array.isArray(rows)) rows = [];
+
+    if (state.hdFilterStatus === 'OPEN_ALL') {
+      rows = rows.filter(t => t.status !== 'CLOSED');
+    }
+
+    state.hdTickets = rows;
+    if (countEl) countEl.textContent = rows.length;
+
+    const prevScroll = listEl.scrollTop;
+    renderHelpdeskTicketsList();
+    if (silent) listEl.scrollTop = prevScroll;
+
+    if (state.hdActiveTicketId) {
+      const stillExists = rows.some(t => String(t.id) === String(state.hdActiveTicketId));
+      if (stillExists) {
+        highlightActiveHdCard();
+      }
+    }
+  } catch (err) {
+    if (!silent) {
+      listEl.innerHTML = `<div class="hd-empty-list text-danger">${escapeHtml(err.message)}</div>`;
+    }
+  }
+}
+
+function formatHdSlaTag(ticket) {
+  if (ticket.status === 'CLOSED') {
+    return { label: '✅ SLA Concluído', cls: '' };
+  }
+  if (ticket.sla_overdue) {
+    return { label: '🚨 SLA Vencido', cls: 'sla-overdue' };
+  }
+  if (ticket.sla_due_at) {
+    const diffMin = Math.round((new Date(ticket.sla_due_at).getTime() - Date.now()) / 60000);
+    if (diffMin <= 30 && diffMin >= 0) {
+      return { label: `⏳ SLA: ${diffMin}min`, cls: 'sla-warn' };
+    }
+    if (diffMin > 30) {
+      return { label: `🕒 Prazo: ${ticket.sla_due_at_br || 'No prazo'}`, cls: '' };
+    }
+  }
+  return { label: '🕒 No Prazo', cls: '' };
+}
+
+function renderHelpdeskTicketsList() {
+  const listEl = document.getElementById('hd-tickets-list');
+  if (!listEl) return;
+
+  const list = state.hdTickets || [];
+  if (list.length === 0) {
+    listEl.innerHTML = `
+      <div class="hd-empty-list">
+        <div style="font-size:1.8rem; margin-bottom:6px;">📭</div>
+        <strong>Nenhum chamado encontrado</strong>
+        <p class="text-xs text-muted" style="margin-top:4px;">Ajuste os filtros acima ou clique em "Novo Chamado / Conversa" para iniciar um atendimento.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const isParent = state.currentUser && state.currentUser.role === 'responsavel';
+
+  listEl.innerHTML = list.map(t => {
+    const isActive = String(t.id) === String(state.hdActiveTicketId);
+    const unread = isParent ? (parseInt(t.unread_by_parent) || 0) : (parseInt(t.unread_by_staff) || 0);
+    const stMeta = HD_STATUS_META[t.status] || HD_STATUS_META.WAITING;
+    const urgMeta = HD_URGENCY_META[t.urgency] || HD_URGENCY_META[3];
+    const slaMeta = formatHdSlaTag(t);
+    const scopeBadge = t.ticket_scope === 'interno' ? '🛠️ Interno' : '👨‍👩‍👧 Família';
+    const personLabel = t.student_name
+      ? `🎓 ${escapeHtml(t.student_name)}`
+      : `👤 ${escapeHtml(t.requester_name || 'Equipe')}`;
+    const preview = t.last_message ? String(t.last_message) : t.subject;
+
+    return `
+      <div class="hd-ticket-card status-${escapeHtml(t.status)} ${isActive ? 'active' : ''} ${unread > 0 ? 'unread' : ''}" data-hd-ticket-id="${t.id}">
+        <div class="hd-card-top">
+          <span class="hd-protocol-badge">#${escapeHtml(t.number)}</span>
+          <span class="hd-scope-badge ${t.ticket_scope === 'interno' ? 'scope-interno' : 'scope-familia'}">${scopeBadge}</span>
+          <span class="hd-status-badge ${stMeta.cls}">${stMeta.label}</span>
+          ${unread > 0 ? `<span class="badge-unread">${unread}</span>` : ''}
+        </div>
+        <h4 class="hd-card-subject">${escapeHtml(t.subject)}</h4>
+        <p class="hd-card-preview">${escapeHtml(preview)}</p>
+        <div class="hd-card-footer">
+          <span>${personLabel} • 📁 ${escapeHtml(t.service_type_name || 'Geral')}</span>
+          <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+            <span class="hd-urgency-badge ${urgMeta.cls}">${urgMeta.label}</span>
+            ${t.status !== 'CLOSED' ? `<span class="hd-sla-badge ${slaMeta.cls}">${slaMeta.label}</span>` : ''}
+            <small class="text-muted">${escapeHtml(t.last_message_at_br || t.created_at_br || '')}</small>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  listEl.querySelectorAll('[data-hd-ticket-id]').forEach(card => {
+    card.addEventListener('click', () => {
+      const id = card.getAttribute('data-hd-ticket-id');
+      selectHdTicket(id);
+    });
+  });
+}
+
+function highlightActiveHdCard() {
+  document.querySelectorAll('#hd-tickets-list .hd-ticket-card').forEach(el => {
+    el.classList.toggle('active', String(el.getAttribute('data-hd-ticket-id')) === String(state.hdActiveTicketId));
+  });
+}
+
+async function selectHdTicket(ticketId) {
+  if (!ticketId) return;
+  state.hdActiveTicketId = Number(ticketId);
+  highlightActiveHdCard();
+
+  const emptyEl = document.getElementById('hd-empty-detail');
+  const activeEl = document.getElementById('hd-active-detail');
+  const workspace = document.getElementById('hd-workspace');
+
+  try {
+    const detail = await apiJson(`/api/helpdesk/tickets/${ticketId}`);
+    state.hdActiveTicketDetail = detail;
+
+    if (emptyEl) emptyEl.classList.add('hidden');
+    if (activeEl) activeEl.classList.remove('hidden');
+    if (workspace) workspace.classList.add('mobile-detail-open');
+
+    renderHdActiveDetail(detail);
+    loadHelpdeskStats();
+    loadHelpdeskTickets();
+    refreshFamilyAlerts();
+  } catch (err) {
+    showAppAlert(err.message, 'Abrir Chamado');
+  }
+}
+
+function renderHdActiveDetail(detail) {
+  if (!detail || !detail.ticket) return;
+  const t = detail.ticket;
+  const messages = detail.messages || [];
+  const notes = detail.notes || [];
+  const events = detail.events || [];
+
+  const stMeta = HD_STATUS_META[t.status] || HD_STATUS_META.WAITING;
+  const urgMeta = HD_URGENCY_META[t.urgency] || HD_URGENCY_META[3];
+  const slaMeta = formatHdSlaTag(t);
+
+  const protoEl = document.getElementById('hd-det-protocol');
+  const scopeEl = document.getElementById('hd-det-scope');
+  const statusEl = document.getElementById('hd-det-status');
+  const urgEl = document.getElementById('hd-det-urgency');
+  const slaEl = document.getElementById('hd-det-sla');
+  const subjEl = document.getElementById('hd-det-subject');
+
+  if (protoEl) protoEl.textContent = `#${t.number}`;
+  if (scopeEl) {
+    scopeEl.textContent = t.ticket_scope === 'interno' ? '🛠️ Interno / Equipe' : '👨‍👩‍👧 Família & Aluno';
+    scopeEl.className = `hd-scope-badge ${t.ticket_scope === 'interno' ? 'scope-interno' : 'scope-familia'}`;
+  }
+  if (statusEl) {
+    statusEl.textContent = stMeta.label;
+    statusEl.className = `hd-status-badge ${stMeta.cls}`;
+  }
+  if (urgEl) {
+    urgEl.textContent = urgMeta.label;
+    urgEl.className = `hd-urgency-badge ${urgMeta.cls}`;
+  }
+  if (slaEl) {
+    slaEl.textContent = slaMeta.label;
+    slaEl.className = `hd-sla-badge ${slaMeta.cls}`;
+  }
+  if (subjEl) subjEl.textContent = t.subject;
+
+  const mQueue = document.getElementById('hd-det-meta-queue');
+  const mStudent = document.getElementById('hd-det-meta-student');
+  const mReq = document.getElementById('hd-det-meta-requester');
+  const mAtt = document.getElementById('hd-det-meta-attendant');
+
+  if (mQueue) mQueue.textContent = `📁 Fila: ${t.service_type_name || 'Geral'}`;
+  if (mStudent) {
+    mStudent.textContent = t.student_name
+      ? `🎓 Aluno: ${t.student_name}${t.teacher_name ? ` (Prof. ${t.teacher_name})` : ''}`
+      : '🎓 Escopo: Interno da Escola';
+  }
+  if (mReq) mReq.textContent = `👤 Solicitante: ${t.requester_name || '—'} (${t.created_at_br || ''})`;
+  if (mAtt) mAtt.textContent = `🎧 Atendente: ${t.attendant_name || 'Aguardando na fila'}`;
+
+  // Botões de ação conforme status
+  const isClosed = t.status === 'CLOSED';
+  const btnClaim = document.getElementById('btn-hd-claim');
+  const btnTransfer = document.getElementById('btn-hd-transfer');
+  const btnClose = document.getElementById('btn-hd-close');
+  const btnReopen = document.getElementById('btn-hd-reopen');
+
+  if (btnClaim) {
+    const alreadyMine = state.currentUser && String(t.attendant_id) === String(state.currentUser.id) && t.status === 'IN_PROGRESS';
+    btnClaim.classList.toggle('hidden', isClosed || alreadyMine);
+  }
+  if (btnTransfer) btnTransfer.classList.toggle('hidden', isClosed);
+  if (btnClose) btnClose.classList.toggle('hidden', isClosed);
+  if (btnReopen) btnReopen.classList.toggle('hidden', !isClosed);
+
+  // Mensagens do Chat
+  renderHdMessagesToContainer(document.getElementById('hd-messages-container'), messages);
+
+  // Notas Internas
+  const notesCountEl = document.getElementById('hd-notes-count');
+  if (notesCountEl) notesCountEl.textContent = notes.length;
+  const notesListEl = document.getElementById('hd-notes-list');
+  if (notesListEl) {
+    if (notes.length === 0) {
+      notesListEl.innerHTML = `<div class="hd-empty-list">Nenhuma nota interna registrada neste chamado.</div>`;
+    } else {
+      notesListEl.innerHTML = notes.map(n => `
+        <div class="hd-note-card">
+          <div class="hd-note-header">
+            <strong>🔒 ${escapeHtml(n.user_name || 'Equipe')}</strong>
+            <small class="text-muted">${escapeHtml(n.created_at_br || '')}</small>
+          </div>
+          <p class="hd-note-body">${escapeHtml(n.content).replace(/\n/g, '<br>')}</p>
+        </div>
+      `).join('');
+    }
+  }
+
+  // Linha do Tempo / Auditoria
+  const eventsEl = document.getElementById('hd-events-timeline');
+  if (eventsEl) {
+    if (events.length === 0) {
+      eventsEl.innerHTML = `<div class="hd-empty-list">Nenhum evento registrado.</div>`;
+    } else {
+      eventsEl.innerHTML = events.map(ev => {
+        const meta = HD_EVENT_LABELS[ev.event_type] || { icon: '📌', label: ev.event_type };
+        return `
+          <div class="hd-event-item">
+            <div class="hd-event-icon">${meta.icon}</div>
+            <div class="hd-event-content">
+              <div class="hd-event-title">
+                <strong>${escapeHtml(meta.label)}</strong>
+                <span>por ${escapeHtml(ev.actor_name || 'Sistema')}</span>
+                <small class="text-muted">• ${escapeHtml(ev.created_at_br || '')}</small>
+              </div>
+              ${(ev.origin_name || ev.destination_name) ? `
+                <div class="text-xs text-muted">
+                  ${ev.origin_name ? `De: <strong>${escapeHtml(ev.origin_name)}</strong> ` : ''}
+                  ${ev.destination_name ? `➔ Para: <strong>${escapeHtml(ev.destination_name)}</strong>` : ''}
+                </div>
+              ` : ''}
+              ${ev.reason ? `<div class="hd-event-reason">${escapeHtml(ev.reason)}</div>` : ''}
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+  }
+}
+
+function renderHdMessagesToContainer(container, messages) {
+  if (!container) return;
+  if (!messages || messages.length === 0) {
+    container.innerHTML = `<div class="hd-empty-list">Nenhuma mensagem nesta conversa ainda.</div>`;
+    return;
+  }
+
+  container.innerHTML = messages.map(m => {
+    const sType = String(m.sender_type || 'CUSTOMER').toUpperCase();
+    const rowCls = sType === 'ATTENDANT' ? 'msg-attendant'
+      : sType === 'BOT' ? 'msg-bot'
+      : sType === 'SYSTEM' ? 'msg-system'
+      : 'msg-customer';
+
+    if (sType === 'SYSTEM') {
+      return `
+        <div class="hd-msg-row msg-system">
+          <div class="hd-msg-bubble">
+            <span>ℹ️ ${escapeHtml(m.content)}</span>
+            <small class="hd-msg-time">${escapeHtml(m.created_at_br || '')}</small>
+          </div>
+        </div>
+      `;
+    }
+
+    const roleBadge = sType === 'BOT' ? '🤖 Assistente'
+      : sType === 'ATTENDANT' ? '🎧 Equipe Entrelinhas'
+      : '👤 Solicitante';
+
+    return `
+      <div class="hd-msg-row ${rowCls}">
+        <div class="hd-msg-bubble">
+          <div class="hd-msg-header">
+            <strong>${escapeHtml(m.sender_name || 'Usuário')}</strong>
+            <span class="hd-msg-role-tag">${roleBadge}</span>
+          </div>
+          <div class="hd-msg-text">${escapeHtml(m.content).replace(/\n/g, '<br>')}</div>
+          <div class="hd-msg-footer">
+            <small class="hd-msg-time">${escapeHtml(m.created_at_br || '')}</small>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  container.scrollTop = container.scrollHeight;
+}
+
+function switchHdDetailTab(tabName) {
+  state.hdActiveTab = tabName || 'chat';
+  document.querySelectorAll('#hd-detail-tabs .hd-detail-tab').forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-hdtab') === state.hdActiveTab);
+  });
+  const chatPanel = document.getElementById('hd-tab-chat');
+  const notesPanel = document.getElementById('hd-tab-notes');
+  const eventsPanel = document.getElementById('hd-tab-events');
+
+  if (chatPanel) chatPanel.classList.toggle('hidden', state.hdActiveTab !== 'chat');
+  if (notesPanel) notesPanel.classList.toggle('hidden', state.hdActiveTab !== 'notes');
+  if (eventsPanel) eventsPanel.classList.toggle('hidden', state.hdActiveTab !== 'events');
+}
+
+// ============================================================================
+// AÇÕES DE CHAMADO (ENVIAR MENSAGEM, NOTA, ASSUMIR, TRANSFERIR, ENCERRAR, REABRIR)
+// ============================================================================
+
+async function handleHdSendMessage(e) {
+  e.preventDefault();
+  if (!state.hdActiveTicketId) return;
+  const input = document.getElementById('hd-message-input');
+  const btn = document.getElementById('btn-hd-send-msg');
+  const content = input ? input.value.trim() : '';
+  if (!content) return;
+
+  if (btn) btn.disabled = true;
+  try {
+    await apiJson(`/api/helpdesk/tickets/${state.hdActiveTicketId}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ content })
+    });
+    if (input) input.value = '';
+    await selectHdTicket(state.hdActiveTicketId);
+  } catch (err) {
+    showAppAlert(err.message, 'Enviar Mensagem');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function handleHdAddNote(e) {
+  e.preventDefault();
+  if (!state.hdActiveTicketId) return;
+  const input = document.getElementById('hd-note-input');
+  const btn = document.getElementById('btn-hd-save-note');
+  const content = input ? input.value.trim() : '';
+  if (!content) return;
+
+  if (btn) btn.disabled = true;
+  try {
+    await apiJson(`/api/helpdesk/tickets/${state.hdActiveTicketId}/notes`, {
+      method: 'POST',
+      body: JSON.stringify({ content })
+    });
+    if (input) input.value = '';
+    showToast('Nota interna registrada!');
+    await selectHdTicket(state.hdActiveTicketId);
+    switchHdDetailTab('notes');
+  } catch (err) {
+    showAppAlert(err.message, 'Nota Interna');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function handleHdClaimTicket() {
+  if (!state.hdActiveTicketId) return;
+  try {
+    await apiJson(`/api/helpdesk/tickets/${state.hdActiveTicketId}/claim`, { method: 'POST' });
+    showToast('Você assumiu este atendimento!');
+    await selectHdTicket(state.hdActiveTicketId);
+  } catch (err) {
+    showAppAlert(err.message, 'Assumir Atendimento');
+  }
+}
+
+async function openHdTransferModal() {
+  if (!state.hdActiveTicketId) return;
+  await loadHelpdeskServiceTypes();
+  await ensureTeacherOptionsLoaded().catch(() => {});
+
+  const modal = document.getElementById('modal-hd-transfer');
+  const form = document.getElementById('form-hd-transfer');
+  if (!modal || !form) return;
+  form.reset();
+
+  document.getElementById('hd-transfer-ticket-id').value = state.hdActiveTicketId;
+  const t = state.hdActiveTicketDetail && state.hdActiveTicketDetail.ticket;
+  const queueSel = document.getElementById('hd-transfer-queue');
+  if (queueSel && t && t.service_type_id) {
+    queueSel.value = String(t.service_type_id);
+  }
+
+  // Popula professores / equipe no select de atendente destino
+  const userSel = document.getElementById('hd-transfer-user');
+  if (userSel) {
+    const teachers = (state.teachers || []).filter(u => u.status === 'ativo');
+    userSel.innerHTML = `<option value="">— Deixar aguardando na fila do setor —</option>` +
+      teachers.map(u => `<option value="${u.id}">👨‍🏫 Prof(a). ${escapeHtml(u.name)}</option>`).join('');
+  }
+
+  modal.classList.remove('hidden');
+}
+
+async function handleHdTransferSubmit(e) {
+  e.preventDefault();
+  const ticketId = document.getElementById('hd-transfer-ticket-id').value || state.hdActiveTicketId;
+  const service_type_id = document.getElementById('hd-transfer-queue').value;
+  const attendant_id = document.getElementById('hd-transfer-user').value;
+  const reason = document.getElementById('hd-transfer-reason').value.trim();
+
+  if (!ticketId || !service_type_id || !reason) {
+    return showAppAlert('Preencha a fila de destino e o motivo da transferência.', 'Transferir Chamado');
+  }
+
+  const btn = document.getElementById('btn-submit-hd-transfer');
+  if (btn) btn.disabled = true;
+  try {
+    await apiJson(`/api/helpdesk/tickets/${ticketId}/transfer`, {
+      method: 'POST',
+      body: JSON.stringify({
+        service_type_id: parseInt(service_type_id),
+        attendant_id: attendant_id ? parseInt(attendant_id) : null,
+        teacher_id: attendant_id ? parseInt(attendant_id) : null,
+        reason
+      })
+    });
+    closeModalById('modal-hd-transfer');
+    showToast('Atendimento transferido com sucesso!');
+    await selectHdTicket(ticketId);
+  } catch (err) {
+    showAppAlert(err.message, 'Transferir Chamado');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function openHdCloseModal(ticketIdOverride = null) {
+  const targetId = ticketIdOverride || state.hdActiveTicketId || state.parentHdActiveTicketId;
+  if (!targetId) return;
+  const modal = document.getElementById('modal-hd-close');
+  const form = document.getElementById('form-hd-close');
+  if (!modal || !form) return;
+  form.reset();
+  document.getElementById('hd-close-ticket-id').value = targetId;
+  modal.classList.remove('hidden');
+}
+
+async function handleHdCloseSubmit(e) {
+  e.preventDefault();
+  const ticketId = document.getElementById('hd-close-ticket-id').value;
+  const resolution_type = document.getElementById('hd-close-type').value;
+  const resolution_summary = document.getElementById('hd-close-summary').value.trim();
+  if (!ticketId) return;
+
+  const btn = document.getElementById('btn-submit-hd-close');
+  if (btn) btn.disabled = true;
+  try {
+    await apiJson(`/api/helpdesk/tickets/${ticketId}/close`, {
+      method: 'POST',
+      body: JSON.stringify({ resolution_type, resolution_summary })
+    });
+    closeModalById('modal-hd-close');
+    showToast('Atendimento encerrado com sucesso!');
+    if (state.currentUser && state.currentUser.role === 'responsavel') {
+      await selectParentHdTicket(ticketId);
+      await loadParentHelpdeskTickets();
+    } else {
+      await selectHdTicket(ticketId);
+    }
+  } catch (err) {
+    showAppAlert(err.message, 'Encerrar Atendimento');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function handleHdReopenTicket(ticketIdOverride = null) {
+  const targetId = ticketIdOverride || state.hdActiveTicketId || state.parentHdActiveTicketId;
+  if (!targetId) return;
+  try {
+    await apiJson(`/api/helpdesk/tickets/${targetId}/reopen`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: 'Reaberto pelo usuário' })
+    });
+    showToast('Atendimento reaberto!');
+    if (state.currentUser && state.currentUser.role === 'responsavel') {
+      await selectParentHdTicket(targetId);
+      await loadParentHelpdeskTickets();
+    } else {
+      await selectHdTicket(targetId);
+    }
+  } catch (err) {
+    showAppAlert(err.message, 'Reabrir Atendimento');
+  }
+}
+
+// ============================================================================
+// MODAL DE NOVO CHAMADO / NOVA CONVERSA (FAMÍLIA + STAFF)
+// ============================================================================
+
+async function openHdNewTicketModal(defaultScope = null) {
+  bindHelpdeskEventsOnce();
+  await loadHelpdeskServiceTypes();
+
+  const modal = document.getElementById('modal-hd-new-ticket');
+  const form = document.getElementById('form-hd-new-ticket');
+  if (!modal || !form) return;
+  form.reset();
+
+  const isParent = state.currentUser && state.currentUser.role === 'responsavel';
+  const scopeGroup = document.getElementById('hd-new-scope-group');
+  const scopeSel = document.getElementById('hd-new-scope');
+  const studentGroup = document.getElementById('hd-new-student-group');
+  const studentSel = document.getElementById('hd-new-student');
+  const urgencyGroup = document.getElementById('hd-new-urgency-group');
+  const titleEl = document.getElementById('modal-hd-new-title');
+
+  if (isParent) {
+    if (titleEl) titleEl.textContent = '💬 Nova Conversa com a Escola';
+    if (scopeGroup) scopeGroup.classList.add('hidden');
+    if (studentGroup) studentGroup.classList.add('hidden');
+    if (urgencyGroup) urgencyGroup.classList.add('hidden');
+    if (scopeSel) scopeSel.value = 'familia';
+    await populateHdNewTicketForParent();
+  } else {
+    if (titleEl) titleEl.textContent = '➕ Novo Chamado / Conversa';
+    if (scopeGroup) scopeGroup.classList.remove('hidden');
+    if (urgencyGroup) urgencyGroup.classList.remove('hidden');
+    const chosenScope = defaultScope || (state.hdFilterScope === 'interno' ? 'interno' : 'familia');
+    if (scopeSel) scopeSel.value = chosenScope;
+
+    if (!state.students || state.students.length === 0) {
+      await loadStudents().catch(() => {});
+    }
+    await ensureTeacherOptionsLoaded().catch(() => {});
+
+    if (studentSel) {
+      const list = state.students || [];
+      studentSel.innerHTML = `<option value="">— Selecione o aluno —</option>` +
+        list.map(s => `<option value="${s.id}">🎓 ${escapeHtml(s.name)} (${escapeHtml(s.objective_grade || 'Regular')})</option>`).join('');
+    }
+
+    syncHdNewModalForStaffScope();
+  }
+
+  modal.classList.remove('hidden');
+}
+window.openHdNewTicketModal = openHdNewTicketModal;
+
+async function populateHdNewTicketForParent() {
+  const queueSel = document.getElementById('hd-new-service-type');
+  const teacherSel = document.getElementById('hd-new-teacher');
+
+  const familyQueues = (state.hdServiceTypes || []).filter(q => !q.restricted_to_staff && q.active !== false);
+  if (queueSel) {
+    queueSel.innerHTML = `<option value="">Selecione o setor de atendimento...</option>` +
+      familyQueues.map(q => `<option value="${q.id}" data-target-role="${escapeHtml(q.target_role || '')}">${escapeHtml(q.name)}</option>`).join('');
+    if (familyQueues.length > 0) queueSel.value = String(familyQueues[0].id);
+  }
+
+  try {
+    const rec = await apiJson('/api/parent/message-recipients');
+    const profs = (rec && Array.isArray(rec.professores)) ? rec.professores : [];
+    if (teacherSel) {
+      teacherSel.innerHTML = `<option value="">— Professor responsável pelo aluno —</option>` +
+        profs.map(p => `<option value="${p.id}">👨‍🏫 Prof(a). ${escapeHtml(p.name)}</option>`).join('');
+      if (profs.length === 1) teacherSel.value = String(profs[0].id);
+    }
+  } catch (e) {}
+
+  updateHdNewTeacherVisibility();
+}
+
+function syncHdNewModalForStaffScope() {
+  const scopeSel = document.getElementById('hd-new-scope');
+  const studentGroup = document.getElementById('hd-new-student-group');
+  const queueSel = document.getElementById('hd-new-service-type');
+  const teacherSel = document.getElementById('hd-new-teacher');
+
+  const scope = scopeSel ? scopeSel.value : 'familia';
+  if (studentGroup) {
+    studentGroup.classList.toggle('hidden', scope === 'interno');
+  }
+
+  const allQueues = (state.hdServiceTypes || []).filter(q => q.active !== false);
+  const filteredQueues = scope === 'interno'
+    ? allQueues.filter(q => q.restricted_to_staff || q.code === '006')
+    : allQueues.filter(q => !q.restricted_to_staff);
+  const queuesToUse = filteredQueues.length > 0 ? filteredQueues : allQueues;
+
+  if (queueSel) {
+    queueSel.innerHTML = queuesToUse.map(q => `<option value="${q.id}" data-target-role="${escapeHtml(q.target_role || '')}">[${escapeHtml(q.code)}] ${escapeHtml(q.name)}</option>`).join('');
+    if (queuesToUse.length > 0) queueSel.value = String(queuesToUse[0].id);
+  }
+
+  if (teacherSel) {
+    const teachers = (state.teachers || []).filter(t => t.status === 'ativo');
+    teacherSel.innerHTML = `<option value="">— Fila geral do setor —</option>` +
+      teachers.map(t => `<option value="${t.id}">👨‍🏫 Prof(a). ${escapeHtml(t.name)}</option>`).join('');
+  }
+
+  updateHdNewTeacherVisibility();
+}
+
+function updateHdNewTeacherVisibility() {
+  const queueSel = document.getElementById('hd-new-service-type');
+  const teacherGroup = document.getElementById('hd-new-teacher-group');
+  if (!queueSel || !teacherGroup) return;
+
+  const q = (state.hdServiceTypes || []).find(item => String(item.id) === String(queueSel.value));
+  const isParent = state.currentUser && state.currentUser.role === 'responsavel';
+  if (isParent) {
+    const showProf = q && (q.target_role === 'professor' || q.code === '001');
+    teacherGroup.classList.toggle('hidden', !showProf);
+  } else {
+    teacherGroup.classList.remove('hidden');
+  }
+}
+
+async function handleHdNewTicketSubmit(e) {
+  e.preventDefault();
+  const isParent = state.currentUser && state.currentUser.role === 'responsavel';
+  const scope = isParent ? 'familia' : (document.getElementById('hd-new-scope').value || 'familia');
+  const student_id = isParent
+    ? (state.parentStudent ? state.parentStudent.id : state.currentUser.student_id)
+    : document.getElementById('hd-new-student').value;
+  const service_type_id = document.getElementById('hd-new-service-type').value;
+  const teacher_id = document.getElementById('hd-new-teacher').value;
+  const urgency = document.getElementById('hd-new-urgency').value;
+  const subject = document.getElementById('hd-new-subject').value.trim();
+  const body = document.getElementById('hd-new-body').value.trim();
+
+  if (!service_type_id) {
+    return showAppAlert('Selecione o setor de atendimento.', 'Abrir Atendimento');
+  }
+  if (scope === 'familia' && !student_id) {
+    return showAppAlert('Selecione o aluno vinculado à conversa.', 'Abrir Atendimento');
+  }
+  if (!subject || !body) {
+    return showAppAlert('Preencha o assunto e a mensagem inicial.', 'Abrir Atendimento');
+  }
+
+  const selectedQueue = (state.hdServiceTypes || []).find(q => String(q.id) === String(service_type_id));
+  const recipient_type = selectedQueue ? selectedQueue.target_role : 'coordenacao';
+
+  const btn = document.getElementById('btn-submit-hd-new');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await apiJson('/api/helpdesk/tickets', {
+      method: 'POST',
+      body: JSON.stringify({
+        ticket_scope: scope,
+        student_id: student_id ? parseInt(student_id) : null,
+        service_type_id: parseInt(service_type_id),
+        recipient_type,
+        teacher_id: teacher_id ? parseInt(teacher_id) : null,
+        urgency: urgency ? parseInt(urgency) : 3,
+        subject,
+        body
+      })
+    });
+
+    closeModalById('modal-hd-new-ticket');
+    showToast(res.message || 'Atendimento aberto com sucesso!');
+
+    if (isParent) {
+      switchParentSubtab('parent-tab-contact');
+      await loadParentHelpdeskTickets();
+      if (res.ticket && res.ticket.id) {
+        await selectParentHdTicket(res.ticket.id);
+      }
+      loadParentFamilyMessages();
+    } else {
+      await loadHelpdeskStats();
+      await loadHelpdeskTickets();
+      if (res.ticket && res.ticket.id) {
+        await selectHdTicket(res.ticket.id);
+      }
+    }
+  } catch (err) {
+    showAppAlert(err.message, 'Abrir Atendimento');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ============================================================================
+// PORTAL DA FAMÍLIA: CENTRAL DE CONVERSAS & HELP DESK (#parent-tab-contact)
+// ============================================================================
+
+async function loadParentHelpdeskTickets(silent = false) {
+  const listEl = document.getElementById('parent-hd-tickets-list');
+  const countEl = document.getElementById('parent-hd-tickets-count');
+  if (!listEl) return;
+
+  try {
+    const studentId = state.parentStudent ? state.parentStudent.id : null;
+    const query = studentId ? `?student_id=${studentId}` : '';
+    const rows = await apiJson(`/api/helpdesk/tickets${query}`);
+    state.parentHdTickets = Array.isArray(rows) ? rows : [];
+    if (countEl) countEl.textContent = state.parentHdTickets.length;
+
+    const prevScroll = listEl.scrollTop;
+    renderParentHdTicketsList();
+    if (silent) listEl.scrollTop = prevScroll;
+
+    if (!state.parentHdActiveTicketId && state.parentHdTickets.length > 0) {
+      selectParentHdTicket(state.parentHdTickets[0].id);
+    }
+  } catch (err) {
+    if (!silent) {
+      listEl.innerHTML = `<div class="hd-empty-list text-danger">${escapeHtml(err.message)}</div>`;
+    }
+  }
+}
+
+function renderParentHdTicketsList() {
+  const listEl = document.getElementById('parent-hd-tickets-list');
+  if (!listEl) return;
+
+  const list = state.parentHdTickets || [];
+  if (list.length === 0) {
+    listEl.innerHTML = `
+      <div class="hd-empty-list">
+        Nenhuma conversa iniciada ainda. Clique em <strong>"➕ Nova Conversa / Chamado"</strong> para falar com a escola.
+      </div>
+    `;
+    return;
+  }
+
+  listEl.innerHTML = list.map(t => {
+    const isActive = String(t.id) === String(state.parentHdActiveTicketId);
+    const unread = parseInt(t.unread_by_parent) || 0;
+    const stMeta = HD_STATUS_META[t.status] || HD_STATUS_META.WAITING;
+    const preview = t.last_message ? String(t.last_message) : t.subject;
+
+    return `
+      <div class="hd-ticket-card status-${escapeHtml(t.status)} ${isActive ? 'active' : ''} ${unread > 0 ? 'unread' : ''}" data-parent-hd-id="${t.id}">
+        <div class="hd-card-top">
+          <span class="hd-protocol-badge">#${escapeHtml(t.number)}</span>
+          <span class="hd-status-badge ${stMeta.cls}">${stMeta.label}</span>
+          ${unread > 0 ? `<span class="badge-unread">${unread}</span>` : ''}
+        </div>
+        <h4 class="hd-card-subject">${escapeHtml(t.subject)}</h4>
+        <p class="hd-card-preview">${escapeHtml(preview)}</p>
+        <div class="hd-card-footer">
+          <span>📁 ${escapeHtml(t.service_type_name || 'Coordenação')}${t.teacher_name ? ` • Prof. ${escapeHtml(t.teacher_name)}` : ''}</span>
+          <small class="text-muted">${escapeHtml(t.last_message_at_br || t.created_at_br || '')}</small>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  listEl.querySelectorAll('[data-parent-hd-id]').forEach(card => {
+    card.addEventListener('click', () => {
+      selectParentHdTicket(card.getAttribute('data-parent-hd-id'));
+    });
+  });
+}
+
+async function selectParentHdTicket(ticketId) {
+  if (!ticketId) return;
+  state.parentHdActiveTicketId = Number(ticketId);
+
+  document.querySelectorAll('#parent-hd-tickets-list .hd-ticket-card').forEach(el => {
+    el.classList.toggle('active', String(el.getAttribute('data-parent-hd-id')) === String(ticketId));
+  });
+
+  const emptyEl = document.getElementById('parent-hd-empty');
+  const activeEl = document.getElementById('parent-hd-active');
+  const workspace = document.getElementById('parent-hd-workspace');
+
+  try {
+    const detail = await apiJson(`/api/helpdesk/tickets/${ticketId}`);
+    state.parentHdActiveDetail = detail;
+    const t = detail.ticket;
+
+    if (emptyEl) emptyEl.classList.add('hidden');
+    if (activeEl) activeEl.classList.remove('hidden');
+    if (workspace) workspace.classList.add('mobile-detail-open');
+
+    const stMeta = HD_STATUS_META[t.status] || HD_STATUS_META.WAITING;
+    const urgMeta = HD_URGENCY_META[t.urgency] || HD_URGENCY_META[3];
+
+    const protoEl = document.getElementById('parent-hd-protocol');
+    const statusEl = document.getElementById('parent-hd-status');
+    const urgEl = document.getElementById('parent-hd-urgency');
+    const subjEl = document.getElementById('parent-hd-subject');
+    const mQueue = document.getElementById('parent-hd-meta-queue');
+    const mStudent = document.getElementById('parent-hd-meta-student');
+    const mAtt = document.getElementById('parent-hd-meta-attendant');
+
+    if (protoEl) protoEl.textContent = `#${t.number}`;
+    if (statusEl) {
+      statusEl.textContent = stMeta.label;
+      statusEl.className = `hd-status-badge ${stMeta.cls}`;
+    }
+    if (urgEl) {
+      urgEl.textContent = urgMeta.label;
+      urgEl.className = `hd-urgency-badge ${urgMeta.cls}`;
+    }
+    if (subjEl) subjEl.textContent = t.subject;
+    if (mQueue) mQueue.textContent = `📁 Setor: ${t.service_type_name || 'Coordenação'}`;
+    if (mStudent) mStudent.textContent = `🎓 Aluno: ${t.student_name || '—'}`;
+    if (mAtt) mAtt.textContent = `👤 Atendente: ${t.attendant_name || (t.teacher_name ? `Prof. ${t.teacher_name}` : 'Equipe Escolar')}`;
+
+    const isClosed = t.status === 'CLOSED';
+    const btnClose = document.getElementById('btn-parent-close-ticket');
+    const btnReopen = document.getElementById('btn-parent-reopen-ticket');
+    if (btnClose) btnClose.classList.toggle('hidden', isClosed);
+    if (btnReopen) btnReopen.classList.toggle('hidden', !isClosed);
+
+    renderHdMessagesToContainer(document.getElementById('parent-hd-messages'), detail.messages || []);
+    loadHelpdeskStats();
+  } catch (err) {
+    showAppAlert(err.message, 'Conversa da Família');
+  }
+}
+
+async function handleParentHdSendMessage(e) {
+  e.preventDefault();
+  if (!state.parentHdActiveTicketId) return;
+  const input = document.getElementById('parent-hd-input');
+  const btn = document.getElementById('btn-parent-hd-send');
+  const content = input ? input.value.trim() : '';
+  if (!content) return;
+
+  if (btn) btn.disabled = true;
+  try {
+    await apiJson(`/api/helpdesk/tickets/${state.parentHdActiveTicketId}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ content })
+    });
+    if (input) input.value = '';
+    await selectParentHdTicket(state.parentHdActiveTicketId);
+    await loadParentHelpdeskTickets();
+    loadParentFamilyMessages();
+  } catch (err) {
+    showAppAlert(err.message, 'Enviar Mensagem');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ============================================================================
+// GESTÃO DE FILAS & SLAs (ADMIN - #modal-hd-queues)
+// ============================================================================
+
+async function openHdQueuesModal() {
+  await loadHelpdeskServiceTypes();
+  resetHdQueueForm();
+  renderHdQueuesAdminList();
+  const modal = document.getElementById('modal-hd-queues');
+  if (modal) modal.classList.remove('hidden');
+}
+
+function resetHdQueueForm() {
+  const form = document.getElementById('form-hd-queue');
+  if (form) form.reset();
+  const idEl = document.getElementById('hd-queue-edit-id');
+  const titleEl = document.getElementById('hd-queue-form-title');
+  const activeEl = document.getElementById('hd-queue-active');
+  if (idEl) idEl.value = '';
+  if (titleEl) titleEl.textContent = '➕ Cadastrar Nova Fila de Atendimento';
+  if (activeEl) activeEl.checked = true;
+}
+
+function renderHdQueuesAdminList() {
+  const listEl = document.getElementById('hd-queues-list');
+  if (!listEl) return;
+  const queues = state.hdServiceTypes || [];
+  if (queues.length === 0) {
+    listEl.innerHTML = `<div class="hd-empty-list">Nenhuma fila cadastrada.</div>`;
+    return;
+  }
+
+  listEl.innerHTML = queues.map(q => {
+    const urgMeta = HD_URGENCY_META[q.urgency] || HD_URGENCY_META[3];
+    return `
+      <div class="hd-queue-item-card" style="display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 14px; border:1px solid var(--border-color); border-radius:10px; margin-bottom:8px; background:#fff;">
+        <div style="min-width:0; flex:1;">
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <span class="hd-protocol-badge">[${escapeHtml(q.code)}]</span>
+            <strong>${escapeHtml(q.name)}</strong>
+            <span class="hd-urgency-badge ${urgMeta.cls}">${urgMeta.label}</span>
+            <span class="hd-sla-badge">⏱️ SLA: ${q.sla_minutes} min</span>
+            ${q.restricted_to_staff ? `<span class="hd-scope-badge scope-interno">🔒 Interno</span>` : `<span class="hd-scope-badge scope-familia">👨‍👩‍👧 Visível aos Pais</span>`}
+            ${!q.active ? `<span class="fm-status">Inativa</span>` : ''}
+          </div>
+          ${q.description ? `<p class="text-xs text-muted" style="margin:4px 0 0;">${escapeHtml(q.description)}</p>` : ''}
+        </div>
+        <div style="display:flex; gap:6px;">
+          <button type="button" class="btn-action-sm" data-hd-edit-queue="${q.id}">✏️ Editar</button>
+          <button type="button" class="btn-action-sm danger" data-hd-del-queue="${q.id}">🗑️</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  listEl.querySelectorAll('[data-hd-edit-queue]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.getAttribute('data-hd-edit-queue');
+      const q = (state.hdServiceTypes || []).find(item => String(item.id) === String(id));
+      if (!q) return;
+      document.getElementById('hd-queue-edit-id').value = q.id;
+      document.getElementById('hd-queue-form-title').textContent = `✏️ Editando Fila [${q.code}]`;
+      document.getElementById('hd-queue-code').value = q.code || '';
+      document.getElementById('hd-queue-name').value = q.name || '';
+      document.getElementById('hd-queue-sla').value = q.sla_minutes || 120;
+      document.getElementById('hd-queue-urgency').value = q.urgency || 3;
+      document.getElementById('hd-queue-target-role').value = q.target_role || 'coordenacao';
+      document.getElementById('hd-queue-restricted').checked = Boolean(q.restricted_to_staff);
+      document.getElementById('hd-queue-active').checked = q.active !== false;
+      document.getElementById('hd-queue-description').value = q.description || '';
+      document.getElementById('hd-queue-welcome').value = q.welcome_message || '';
+    });
+  });
+
+  listEl.querySelectorAll('[data-hd-del-queue]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.getAttribute('data-hd-del-queue');
+      showAppConfirm('Deseja remover esta fila de atendimento?', async () => {
+        try {
+          await apiJson(`/api/helpdesk/service-types/${id}`, { method: 'DELETE' });
+          showToast('Fila removida!');
+          await loadHelpdeskServiceTypes();
+          renderHdQueuesAdminList();
+        } catch (err) {
+          showAppAlert(err.message, 'Remover Fila');
+        }
+      }, 'Remover Fila', true);
+    });
+  });
+}
+
+async function handleHdQueueSave(e) {
+  e.preventDefault();
+  const editId = document.getElementById('hd-queue-edit-id').value;
+  const payload = {
+    code: document.getElementById('hd-queue-code').value.trim(),
+    name: document.getElementById('hd-queue-name').value.trim(),
+    sla_minutes: parseInt(document.getElementById('hd-queue-sla').value) || 120,
+    urgency: parseInt(document.getElementById('hd-queue-urgency').value) || 3,
+    target_role: document.getElementById('hd-queue-target-role').value || 'coordenacao',
+    restricted_to_staff: document.getElementById('hd-queue-restricted').checked,
+    active: document.getElementById('hd-queue-active').checked,
+    description: document.getElementById('hd-queue-description').value.trim(),
+    welcome_message: document.getElementById('hd-queue-welcome').value.trim()
+  };
+
+  const btn = document.getElementById('btn-hd-queue-save');
+  if (btn) btn.disabled = true;
+  try {
+    const url = editId ? `/api/helpdesk/service-types/${editId}` : '/api/helpdesk/service-types';
+    const method = editId ? 'PUT' : 'POST';
+    await apiJson(url, { method, body: JSON.stringify(payload) });
+    showToast(editId ? 'Fila atualizada!' : 'Nova fila criada!');
+    resetHdQueueForm();
+    await loadHelpdeskServiceTypes();
+    renderHdQueuesAdminList();
+  } catch (err) {
+    showAppAlert(err.message, 'Salvar Fila');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ============================================================================
+// BINDING DE EVENTOS DO HELP DESK
+// ============================================================================
+
+function bindHelpdeskEventsOnce() {
+  if (state.hdEventsBound) return;
+  state.hdEventsBound = true;
+
+  const btnNew = document.getElementById('btn-hd-new-ticket');
+  if (btnNew) btnNew.addEventListener('click', () => openHdNewTicketModal());
+
+  const btnParentNew = document.getElementById('btn-parent-new-ticket');
+  if (btnParentNew) btnParentNew.addEventListener('click', () => openHdNewTicketModal('familia'));
+
+  const btnQueues = document.getElementById('btn-hd-manage-queues');
+  if (btnQueues) btnQueues.addEventListener('click', openHdQueuesModal);
+
+  document.querySelectorAll('#hd-scope-pills .hd-scope-pill').forEach(pill => {
+    pill.addEventListener('click', () => {
+      document.querySelectorAll('#hd-scope-pills .hd-scope-pill').forEach(p => p.classList.remove('active'));
+      pill.classList.add('active');
+      state.hdFilterScope = pill.getAttribute('data-scope') || '';
+      loadHelpdeskTickets();
+    });
+  });
+
+  const fStatus = document.getElementById('hd-filter-status');
+  if (fStatus) fStatus.addEventListener('change', () => {
+    state.hdFilterStatus = fStatus.value;
+    loadHelpdeskTickets();
+  });
+
+  const fQueue = document.getElementById('hd-filter-queue');
+  if (fQueue) fQueue.addEventListener('change', () => {
+    state.hdFilterQueue = fQueue.value;
+    loadHelpdeskTickets();
+  });
+
+  const fUrgency = document.getElementById('hd-filter-urgency');
+  if (fUrgency) fUrgency.addEventListener('change', () => {
+    state.hdFilterUrgency = fUrgency.value;
+    loadHelpdeskTickets();
+  });
+
+  const fSearch = document.getElementById('hd-search-input');
+  if (fSearch) fSearch.addEventListener('input', () => {
+    state.hdSearchQuery = fSearch.value.trim();
+    loadHelpdeskTickets();
+  });
+
+  document.querySelectorAll('#hd-detail-tabs .hd-detail-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      switchHdDetailTab(tab.getAttribute('data-hdtab'));
+    });
+  });
+
+  const btnBackStaff = document.getElementById('btn-hd-back-list');
+  if (btnBackStaff) btnBackStaff.addEventListener('click', () => {
+    const ws = document.getElementById('hd-workspace');
+    if (ws) ws.classList.remove('mobile-detail-open');
+  });
+
+  const btnBackParent = document.getElementById('btn-parent-hd-back');
+  if (btnBackParent) btnBackParent.addEventListener('click', () => {
+    const ws = document.getElementById('parent-hd-workspace');
+    if (ws) ws.classList.remove('mobile-detail-open');
+  });
+
+  const btnClaim = document.getElementById('btn-hd-claim');
+  if (btnClaim) btnClaim.addEventListener('click', handleHdClaimTicket);
+
+  const btnTransfer = document.getElementById('btn-hd-transfer');
+  if (btnTransfer) btnTransfer.addEventListener('click', openHdTransferModal);
+
+  const btnClose = document.getElementById('btn-hd-close');
+  if (btnClose) btnClose.addEventListener('click', () => openHdCloseModal(state.hdActiveTicketId));
+
+  const btnReopen = document.getElementById('btn-hd-reopen');
+  if (btnReopen) btnReopen.addEventListener('click', () => handleHdReopenTicket(state.hdActiveTicketId));
+
+  const btnParentClose = document.getElementById('btn-parent-close-ticket');
+  if (btnParentClose) btnParentClose.addEventListener('click', () => openHdCloseModal(state.parentHdActiveTicketId));
+
+  const btnParentReopen = document.getElementById('btn-parent-reopen-ticket');
+  if (btnParentReopen) btnParentReopen.addEventListener('click', () => handleHdReopenTicket(state.parentHdActiveTicketId));
+
+  const formSendMsg = document.getElementById('form-hd-send-message');
+  if (formSendMsg) formSendMsg.addEventListener('submit', handleHdSendMessage);
+
+  const msgInput = document.getElementById('hd-message-input');
+  if (msgInput && formSendMsg) {
+    msgInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        formSendMsg.requestSubmit();
+      }
+    });
+  }
+
+  const formAddNote = document.getElementById('form-hd-add-note');
+  if (formAddNote) formAddNote.addEventListener('submit', handleHdAddNote);
+
+  const formParentMsg = document.getElementById('form-parent-hd-message');
+  if (formParentMsg) formParentMsg.addEventListener('submit', handleParentHdSendMessage);
+
+  const parentMsgInput = document.getElementById('parent-hd-input');
+  if (parentMsgInput && formParentMsg) {
+    parentMsgInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        formParentMsg.requestSubmit();
+      }
+    });
+  }
+
+  const formNewTicket = document.getElementById('form-hd-new-ticket');
+  if (formNewTicket) formNewTicket.addEventListener('submit', handleHdNewTicketSubmit);
+
+  const scopeSelect = document.getElementById('hd-new-scope');
+  if (scopeSelect) scopeSelect.addEventListener('change', syncHdNewModalForStaffScope);
+
+  const newQueueSelect = document.getElementById('hd-new-service-type');
+  if (newQueueSelect) newQueueSelect.addEventListener('change', updateHdNewTeacherVisibility);
+
+  const formTransfer = document.getElementById('form-hd-transfer');
+  if (formTransfer) formTransfer.addEventListener('submit', handleHdTransferSubmit);
+
+  const formClose = document.getElementById('form-hd-close');
+  if (formClose) formClose.addEventListener('submit', handleHdCloseSubmit);
+
+  const formQueue = document.getElementById('form-hd-queue');
+  if (formQueue) formQueue.addEventListener('submit', handleHdQueueSave);
+
+  const btnResetQueue = document.getElementById('btn-hd-queue-reset');
+  if (btnResetQueue) btnResetQueue.addEventListener('click', resetHdQueueForm);
+
+  const closeBindings = [
+    ['btn-close-hd-new-modal', 'modal-hd-new-ticket'],
+    ['btn-cancel-hd-new', 'modal-hd-new-ticket'],
+    ['btn-close-hd-transfer-modal', 'modal-hd-transfer'],
+    ['btn-cancel-hd-transfer', 'modal-hd-transfer'],
+    ['btn-close-hd-close-modal', 'modal-hd-close'],
+    ['btn-cancel-hd-close', 'modal-hd-close'],
+    ['btn-close-hd-queues-modal', 'modal-hd-queues']
+  ];
+  closeBindings.forEach(([btnId, modalId]) => {
+    const b = document.getElementById(btnId);
+    if (b) b.addEventListener('click', () => closeModalById(modalId));
+  });
+
+  startHelpdeskRealtimeLoop();
+}
+
+// ============================================================================
+// REAL-TIME UPDATES (SSE EventSource + 3s Polling Silencioso)
+// ============================================================================
+
+function getActiveParentSubtabId() {
+  const el = document.querySelector('.parent-subview-content:not(.hidden)');
+  if (el && el.id) {
+    state.parentActiveSubtab = el.id;
+    return el.id;
+  }
+  return state.parentActiveSubtab || 'parent-tab-agenda';
+}
+
+function connectHelpdeskStream() {
+  if (!state.token || typeof EventSource === 'undefined') return;
+  if (hdState.sseSource && hdState.sseToken === state.token && hdState.sseSource.readyState !== EventSource.CLOSED) {
+    return;
+  }
+
+  disconnectHelpdeskStream();
+  hdState.sseToken = state.token;
+
+  try {
+    const streamUrl = `${API_BASE}/api/helpdesk/stream?token=${encodeURIComponent(state.token)}`;
+    const es = new EventSource(streamUrl);
+    hdState.sseSource = es;
+
+    es.onmessage = (event) => {
+      if (!event || !event.data) return;
+      try {
+        const data = JSON.parse(event.data);
+        if (data && (data.type === 'ticket_created' || data.type === 'message_created' || data.type === 'ticket_updated')) {
+          handleHelpdeskRealtimeUpdate(data);
+        }
+      } catch (err) {
+        // Ignora heartbeats ou comentários
+      }
+    };
+
+    es.onerror = () => {
+      if (hdState.sseSource) {
+        try { hdState.sseSource.close(); } catch (e) {}
+        hdState.sseSource = null;
+      }
+      if (hdState.sseReconnectTimer) clearTimeout(hdState.sseReconnectTimer);
+      if (state.token) {
+        hdState.sseReconnectTimer = setTimeout(() => {
+          connectHelpdeskStream();
+        }, 3500);
+      }
+    };
+  } catch (err) {
+    // Fallback automático pelo polling de 3s
+  }
+}
+
+function disconnectHelpdeskStream() {
+  if (hdState.sseReconnectTimer) {
+    clearTimeout(hdState.sseReconnectTimer);
+    hdState.sseReconnectTimer = null;
+  }
+  if (hdState.sseSource) {
+    try { hdState.sseSource.close(); } catch (e) {}
+    hdState.sseSource = null;
+  }
+  hdState.sseToken = null;
+}
+
+async function silentRefreshActiveHdTicket() {
+  // 1. Painel da Equipe (#view-helpdesk)
+  if (state.activeView === 'view-helpdesk' && hdState.selectedTicketId) {
+    const ticketId = hdState.selectedTicketId;
+    try {
+      const detail = await apiJson(`/api/helpdesk/tickets/${ticketId}`);
+      if (String(hdState.selectedTicketId) !== String(ticketId)) return;
+
+      const prevDetail = state.hdActiveTicketDetail;
+      const prevMsgs = (prevDetail && prevDetail.messages) || [];
+      const newMsgs = (detail && detail.messages) || [];
+      const prevLastId = prevMsgs.length ? prevMsgs[prevMsgs.length - 1].id : null;
+      const newLastId = newMsgs.length ? newMsgs[newMsgs.length - 1].id : null;
+
+      const prevTicket = (prevDetail && prevDetail.ticket) || {};
+      const newTicket = (detail && detail.ticket) || {};
+
+      const msgChanged = prevMsgs.length !== newMsgs.length || prevLastId !== newLastId;
+      const statusChanged =
+        prevTicket.status !== newTicket.status ||
+        prevTicket.attendant_id !== newTicket.attendant_id ||
+        prevTicket.service_type_id !== newTicket.service_type_id ||
+        prevTicket.urgency !== newTicket.urgency ||
+        ((prevDetail && prevDetail.notes && prevDetail.notes.length) !== (detail && detail.notes && detail.notes.length));
+
+      state.hdActiveTicketDetail = detail;
+
+      if (msgChanged || statusChanged) {
+        const input = document.getElementById('hd-message-input');
+        const noteInput = document.getElementById('hd-note-input');
+        const activeEl = document.activeElement;
+        const savedVal = input ? input.value : '';
+        const savedSelStart = (input && activeEl === input) ? input.selectionStart : null;
+        const savedSelEnd = (input && activeEl === input) ? input.selectionEnd : null;
+
+        renderHdActiveDetail(detail);
+        const container = document.getElementById('hd-messages-container');
+        if (container) container.scrollTop = container.scrollHeight;
+
+        if (input && input.value !== savedVal) input.value = savedVal;
+        if (activeEl === input && input) {
+          input.focus();
+          if (savedSelStart !== null && savedSelEnd !== null) {
+            try { input.setSelectionRange(savedSelStart, savedSelEnd); } catch (e) {}
+          }
+        } else if (activeEl === noteInput && noteInput) {
+          noteInput.focus();
+        }
+      }
+    } catch (err) {
+      // Silencioso
+    }
+  }
+
+  // 2. Portal da Família (#view-parent-portal -> #parent-tab-contact)
+  const parentSubtab = getActiveParentSubtabId();
+  if (state.activeView === 'view-parent-portal' && parentSubtab === 'parent-tab-contact' && hdState.parentSelectedTicketId) {
+    const ticketId = hdState.parentSelectedTicketId;
+    try {
+      const detail = await apiJson(`/api/helpdesk/tickets/${ticketId}`);
+      if (String(hdState.parentSelectedTicketId) !== String(ticketId)) return;
+
+      const prevDetail = state.parentHdActiveDetail;
+      const prevMsgs = (prevDetail && prevDetail.messages) || [];
+      const newMsgs = (detail && detail.messages) || [];
+      const prevLastId = prevMsgs.length ? prevMsgs[prevMsgs.length - 1].id : null;
+      const newLastId = newMsgs.length ? newMsgs[newMsgs.length - 1].id : null;
+
+      const prevTicket = (prevDetail && prevDetail.ticket) || {};
+      const newTicket = (detail && detail.ticket) || {};
+
+      const msgChanged = prevMsgs.length !== newMsgs.length || prevLastId !== newLastId;
+      const statusChanged =
+        prevTicket.status !== newTicket.status ||
+        prevTicket.attendant_id !== newTicket.attendant_id ||
+        prevTicket.service_type_id !== newTicket.service_type_id ||
+        prevTicket.urgency !== newTicket.urgency;
+
+      state.parentHdActiveDetail = detail;
+
+      if (msgChanged || statusChanged) {
+        const input = document.getElementById('parent-hd-input');
+        const wasFocused = document.activeElement === input;
+        const savedVal = input ? input.value : '';
+        const savedSelStart = (input && wasFocused) ? input.selectionStart : null;
+        const savedSelEnd = (input && wasFocused) ? input.selectionEnd : null;
+
+        const t = detail.ticket;
+        const stMeta = HD_STATUS_META[t.status] || HD_STATUS_META.WAITING;
+        const urgMeta = HD_URGENCY_META[t.urgency] || HD_URGENCY_META[3];
+
+        const statusEl = document.getElementById('parent-hd-status');
+        const urgEl = document.getElementById('parent-hd-urgency');
+        const mQueue = document.getElementById('parent-hd-meta-queue');
+        const mAtt = document.getElementById('parent-hd-meta-attendant');
+
+        if (statusEl) {
+          statusEl.textContent = stMeta.label;
+          statusEl.className = `hd-status-badge ${stMeta.cls}`;
+        }
+        if (urgEl) {
+          urgEl.textContent = urgMeta.label;
+          urgEl.className = `hd-urgency-badge ${urgMeta.cls}`;
+        }
+        if (mQueue) mQueue.textContent = `📁 Setor: ${t.service_type_name || 'Coordenação'}`;
+        if (mAtt) mAtt.textContent = `👤 Atendente: ${t.attendant_name || (t.teacher_name ? `Prof. ${t.teacher_name}` : 'Equipe Escolar')}`;
+
+        const isClosed = t.status === 'CLOSED';
+        const btnClose = document.getElementById('btn-parent-close-ticket');
+        const btnReopen = document.getElementById('btn-parent-reopen-ticket');
+        if (btnClose) btnClose.classList.toggle('hidden', isClosed);
+        if (btnReopen) btnReopen.classList.toggle('hidden', !isClosed);
+
+        const container = document.getElementById('parent-hd-messages');
+        renderHdMessagesToContainer(container, detail.messages || []);
+        if (container) container.scrollTop = container.scrollHeight;
+
+        if (input && input.value !== savedVal) input.value = savedVal;
+        if (wasFocused && input) {
+          input.focus();
+          if (savedSelStart !== null && savedSelEnd !== null) {
+            try { input.setSelectionRange(savedSelStart, savedSelEnd); } catch (e) {}
+          }
+        }
+      }
+    } catch (err) {
+      // Silencioso
+    }
+  }
+}
+
+async function handleHelpdeskRealtimeUpdate(eventPayload = null) {
+  if (!state.token || hdState.refreshInFlight) return;
+  hdState.refreshInFlight = true;
+  try {
+    await loadHelpdeskStats();
+
+    if (state.activeView === 'view-helpdesk') {
+      await loadHelpdeskTickets(true);
+    }
+
+    const parentSubtab = getActiveParentSubtabId();
+    if (state.activeView === 'view-parent-portal' && parentSubtab === 'parent-tab-contact') {
+      await loadParentHelpdeskTickets(true);
+    }
+
+    await silentRefreshActiveHdTicket();
+  } catch (err) {
+    // Silencioso em background
+  } finally {
+    hdState.refreshInFlight = false;
+  }
+}
+
+function startHelpdeskRealtimeLoop() {
+  if (hdState.pollTimer) return;
+
+  if (state.token) {
+    connectHelpdeskStream();
+  }
+
+  hdState.pollTimer = setInterval(() => {
+    if (!state.token) {
+      disconnectHelpdeskStream();
+      return;
+    }
+
+    connectHelpdeskStream();
+
+    const parentSubtab = getActiveParentSubtabId();
+    const isHdActive = state.activeView === 'view-helpdesk';
+    const isParentContactActive = state.activeView === 'view-parent-portal' && parentSubtab === 'parent-tab-contact';
+
+    if (isHdActive || isParentContactActive) {
+      handleHelpdeskRealtimeUpdate({ type: 'poll_tick' });
+    }
+  }, 3000);
+}

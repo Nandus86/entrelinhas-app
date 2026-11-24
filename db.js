@@ -565,6 +565,99 @@ async function initDB(seedDataFn) {
         CREATE INDEX IF NOT EXISTS idx_family_messages_student ON family_messages(student_id, created_at DESC);
       `);
 
+      // ========================================================
+      // ESTRUTURAS DE HELP DESK & CENTRAL DE CONVERSAS UNIFICADA
+      // ========================================================
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS helpdesk_service_types (
+          id SERIAL PRIMARY KEY,
+          code VARCHAR(10) UNIQUE NOT NULL,
+          name VARCHAR(120) NOT NULL,
+          description TEXT,
+          urgency INT NOT NULL DEFAULT 3,
+          sla_minutes INT NOT NULL DEFAULT 120,
+          welcome_message TEXT,
+          target_role VARCHAR(30) DEFAULT 'coordenacao',
+          restricted_to_staff BOOLEAN DEFAULT false,
+          active BOOLEAN DEFAULT true,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS helpdesk_tickets (
+          id SERIAL PRIMARY KEY,
+          number VARCHAR(40) UNIQUE NOT NULL,
+          ticket_scope VARCHAR(20) NOT NULL DEFAULT 'familia',
+          student_id INT REFERENCES students(id) ON DELETE CASCADE,
+          service_type_id INT REFERENCES helpdesk_service_types(id) ON DELETE SET NULL,
+          service_type_name VARCHAR(120),
+          recipient_type VARCHAR(30) DEFAULT 'coordenacao',
+          teacher_id INT REFERENCES users(id) ON DELETE SET NULL,
+          attendant_id INT REFERENCES users(id) ON DELETE SET NULL,
+          attendant_name VARCHAR(150),
+          requester_role VARCHAR(30) NOT NULL,
+          requester_user_id INT REFERENCES users(id) ON DELETE SET NULL,
+          requester_name VARCHAR(150) NOT NULL,
+          subject VARCHAR(200) NOT NULL,
+          urgency INT NOT NULL DEFAULT 3,
+          status VARCHAR(30) NOT NULL DEFAULT 'WAITING',
+          unread_by_parent INT DEFAULT 0,
+          unread_by_staff INT DEFAULT 0,
+          last_message TEXT,
+          last_message_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          sla_due_at TIMESTAMP WITH TIME ZONE,
+          first_response_at TIMESTAMP WITH TIME ZONE,
+          closed_at TIMESTAMP WITH TIME ZONE,
+          resolution_type VARCHAR(30),
+          resolution_summary TEXT,
+          transfer_count INT DEFAULT 0,
+          legacy_family_msg_id INT UNIQUE,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_helpdesk_tickets_status ON helpdesk_tickets(status, last_message_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_helpdesk_tickets_student ON helpdesk_tickets(student_id, last_message_at DESC);
+
+        CREATE TABLE IF NOT EXISTS helpdesk_messages (
+          id SERIAL PRIMARY KEY,
+          ticket_id INT NOT NULL REFERENCES helpdesk_tickets(id) ON DELETE CASCADE,
+          sender_user_id INT REFERENCES users(id) ON DELETE SET NULL,
+          sender_name VARCHAR(150) NOT NULL,
+          sender_type VARCHAR(30) NOT NULL DEFAULT 'CUSTOMER',
+          sender_role VARCHAR(30),
+          type VARCHAR(30) DEFAULT 'TEXT',
+          content TEXT NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_helpdesk_messages_ticket ON helpdesk_messages(ticket_id, created_at ASC);
+
+        CREATE TABLE IF NOT EXISTS helpdesk_ticket_notes (
+          id SERIAL PRIMARY KEY,
+          ticket_id INT NOT NULL REFERENCES helpdesk_tickets(id) ON DELETE CASCADE,
+          user_id INT REFERENCES users(id) ON DELETE SET NULL,
+          user_name VARCHAR(150) NOT NULL,
+          content TEXT NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_helpdesk_notes_ticket ON helpdesk_ticket_notes(ticket_id, created_at ASC);
+
+        CREATE TABLE IF NOT EXISTS helpdesk_ticket_events (
+          id SERIAL PRIMARY KEY,
+          ticket_id INT NOT NULL REFERENCES helpdesk_tickets(id) ON DELETE CASCADE,
+          event_type VARCHAR(40) NOT NULL,
+          actor_name VARCHAR(150),
+          origin_name VARCHAR(150),
+          destination_name VARCHAR(150),
+          reason TEXT,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_helpdesk_events_ticket ON helpdesk_ticket_events(ticket_id, created_at ASC);
+      `);
+
+      // Seed automático das 6 filas padrão (se a tabela estiver vazia)
+      await seedHelpdeskServiceTypes(client);
+      // Migração automática idempotente de family_messages -> helpdesk_tickets
+      await migrateLegacyFamilyMessagesToHelpdesk(client);
+
       // Controle de execução única dos povoamentos e migrações de dados.
       // Sem isso, cada reinício do servidor sobrescrevia edições feitas pelo admin.
       await client.query(`
@@ -1430,6 +1523,203 @@ async function seedEducationalPortalData(client) {
   }
 }
 
+async function seedHelpdeskServiceTypes(client) {
+  try {
+    const countRes = await client.query('SELECT COUNT(*) FROM helpdesk_service_types');
+    if (parseInt(countRes.rows[0].count) > 0) return;
+
+    console.log(' Povoando filas de atendimento (Help Desk & Conversas)...');
+    const queues = [
+      {
+        code: '001',
+        name: 'Dúvida Pedagógica / Professor',
+        description: 'Dúvidas de aulas, exercícios, conteúdos trabalhados e acompanhamento direto com o professor.',
+        urgency: 3,
+        sla_minutes: 120,
+        target_role: 'professor',
+        restricted_to_staff: false,
+        welcome_message: 'Olá! Sua mensagem foi encaminhada ao professor responsável. Em breve retornaremos por aqui.'
+      },
+      {
+        code: '002',
+        name: 'Coordenação Pedagógica',
+        description: 'Alinhamento pedagógico, adaptações curriculares, reuniões de pais e acompanhamento geral.',
+        urgency: 3,
+        sla_minutes: 60,
+        target_role: 'coordenacao',
+        restricted_to_staff: false,
+        welcome_message: 'Olá! A Coordenação Pedagógica recebeu sua solicitação e já está analisando.'
+      },
+      {
+        code: '003',
+        name: 'Secretaria & Matrículas',
+        description: 'Documentação escolar, declarações, dados cadastrais e contratos de matrícula.',
+        urgency: 2,
+        sla_minutes: 180,
+        target_role: 'secretaria',
+        restricted_to_staff: false,
+        welcome_message: 'Olá! A Secretaria Escolar recebeu seu chamado.'
+      },
+      {
+        code: '004',
+        name: 'Financeiro & Mensalidades',
+        description: 'Faturas, pagamentos via Pix, recibos, planos e negociações financeiras.',
+        urgency: 3,
+        sla_minutes: 120,
+        target_role: 'financeiro',
+        restricted_to_staff: false,
+        welcome_message: 'Olá! O setor Financeiro recebeu sua mensagem e verificará sua solicitação.'
+      },
+      {
+        code: '005',
+        name: 'Reposição & Reagendamento de Aula',
+        description: 'Justificativa de faltas, avisos de ausência e solicitação de reposição ou troca de horário.',
+        urgency: 4,
+        sla_minutes: 60,
+        target_role: 'coordenacao',
+        restricted_to_staff: false,
+        welcome_message: 'Olá! Recebemos seu pedido de reagendamento/reposição. Vamos verificar a disponibilidade na grade.'
+      },
+      {
+        code: '006',
+        name: 'Suporte Técnico / Salas & Projetos (Interno)',
+        description: 'Chamados internos da equipe: equipamentos de sala, recursos pedagógicos, sistema e projetos.',
+        urgency: 4,
+        sla_minutes: 30,
+        target_role: 'suporte',
+        restricted_to_staff: true,
+        welcome_message: 'Chamado técnico interno registrado na fila de Suporte/Projetos.'
+      }
+    ];
+
+    for (const q of queues) {
+      await client.query(`
+        INSERT INTO helpdesk_service_types
+          (code, name, description, urgency, sla_minutes, welcome_message, target_role, restricted_to_staff, active)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+        ON CONFLICT (code) DO NOTHING
+      `, [q.code, q.name, q.description, q.urgency, q.sla_minutes, q.welcome_message, q.target_role, q.restricted_to_staff]);
+    }
+    console.log(' Filas do Help Desk configuradas com sucesso!');
+  } catch (err) {
+    console.error('Erro ao semear filas do Help Desk:', err);
+  }
+}
+
+async function migrateLegacyFamilyMessagesToHelpdesk(client) {
+  try {
+    const unmigratedRes = await client.query(`
+      SELECT fm.*, st.name AS student_name, st.parent_name AS student_parent_name, u.name AS teacher_name
+      FROM family_messages fm
+      JOIN students st ON st.id = fm.student_id
+      LEFT JOIN users u ON u.id = fm.teacher_id
+      WHERE NOT EXISTS (
+        SELECT 1 FROM helpdesk_tickets ht WHERE ht.legacy_family_msg_id = fm.id
+      )
+      ORDER BY fm.id ASC
+    `);
+
+    if (unmigratedRes.rows.length === 0) return;
+
+    const typesRes = await client.query(`SELECT * FROM helpdesk_service_types WHERE code IN ('001', '002')`);
+    const type001 = typesRes.rows.find(t => t.code === '001');
+    const type002 = typesRes.rows.find(t => t.code === '002');
+
+    for (const fm of unmigratedRes.rows) {
+      const isProf = fm.recipient_type === 'professor';
+      const sType = isProf ? (type001 || type002) : (type002 || type001);
+      const codePrefix = isProf ? '001' : '002';
+      const tempNumber = `EN${codePrefix}-TMP-${fm.id}`;
+      const isClosed = fm.status === 'respondida' || Boolean(fm.reply);
+      const ticketStatus = isClosed ? 'CLOSED' : 'WAITING';
+      const requesterName = fm.parent_name || fm.student_parent_name || `Família de ${fm.student_name}`;
+      const cleanBody = String(fm.body || '').trim();
+      const subject = cleanBody.length > 65 ? cleanBody.slice(0, 62) + '...' : (cleanBody || `Mensagem sobre ${fm.student_name}`);
+      const lastMsg = fm.reply ? String(fm.reply).trim() : cleanBody;
+      const lastMsgAt = fm.replied_at || fm.created_at || new Date();
+      const slaMin = sType ? (parseInt(sType.sla_minutes) || 120) : 120;
+
+      const insTicket = await client.query(`
+        INSERT INTO helpdesk_tickets (
+          number, ticket_scope, student_id, service_type_id, service_type_name,
+          recipient_type, teacher_id, attendant_id, attendant_name,
+          requester_role, requester_user_id, requester_name,
+          subject, urgency, status, unread_by_parent, unread_by_staff,
+          last_message, last_message_at, sla_due_at, first_response_at, closed_at,
+          resolution_type, resolution_summary, legacy_family_msg_id, created_at, updated_at
+        ) VALUES (
+          $1, 'familia', $2, $3, $4,
+          $5, $6, $7, $8,
+          'responsavel', $9, $10,
+          $11, $12, $13, 0, $14,
+          $15, $16, ($17::timestamptz + ($18 || ' minutes')::interval), $19, $20,
+          $21, $22, $23, $17, $16
+        )
+        ON CONFLICT (legacy_family_msg_id) DO NOTHING
+        RETURNING id
+      `, [
+        tempNumber,
+        fm.student_id,
+        sType ? sType.id : null,
+        sType ? sType.name : (isProf ? 'Dúvida Pedagógica / Professor' : 'Coordenação Pedagógica'),
+        isProf ? 'professor' : 'coordenacao',
+        fm.teacher_id || null,
+        fm.reply_by || fm.teacher_id || null,
+        fm.reply_by_name || fm.teacher_name || null,
+        fm.parent_user_id || null,
+        requesterName,
+        subject,
+        sType ? sType.urgency : 3,
+        ticketStatus,
+        fm.status === 'nova' ? 1 : 0,
+        lastMsg,
+        lastMsgAt,
+        fm.created_at || new Date(),
+        String(slaMin),
+        fm.replied_at || null,
+        isClosed ? (fm.replied_at || new Date()) : null,
+        isClosed ? 'RESOLVED' : null,
+        isClosed ? 'Respondido pela equipe escolar.' : null,
+        fm.id
+      ]);
+
+      if (insTicket.rows.length > 0) {
+        const ticketId = insTicket.rows[0].id;
+        const finalNumber = `EN${codePrefix}-${String(ticketId).padStart(5, '0')}`;
+        await client.query(`UPDATE helpdesk_tickets SET number = $1 WHERE id = $2`, [finalNumber, ticketId]);
+
+        // 1ª mensagem: da família
+        await client.query(`
+          INSERT INTO helpdesk_messages (ticket_id, sender_user_id, sender_name, sender_type, sender_role, type, content, created_at)
+          VALUES ($1, $2, $3, 'CUSTOMER', 'responsavel', 'TEXT', $4, $5)
+        `, [ticketId, fm.parent_user_id || null, requesterName, cleanBody, fm.created_at || new Date()]);
+
+        // Evento CREATED
+        await client.query(`
+          INSERT INTO helpdesk_ticket_events (ticket_id, event_type, actor_name, destination_name, created_at)
+          VALUES ($1, 'CREATED', $2, $3, $4)
+        `, [ticketId, requesterName, sType ? sType.name : 'Atendimento Escolar', fm.created_at || new Date()]);
+
+        // Se houver reply, insere mensagem do atendente e evento CLOSED
+        if (fm.reply) {
+          const replierName = fm.reply_by_name || fm.teacher_name || 'Equipe Escolar';
+          await client.query(`
+            INSERT INTO helpdesk_messages (ticket_id, sender_user_id, sender_name, sender_type, sender_role, type, content, created_at)
+            VALUES ($1, $2, $3, 'ATTENDANT', 'staff', 'TEXT', $4, $5)
+          `, [ticketId, fm.reply_by || null, replierName, String(fm.reply).trim(), fm.replied_at || new Date()]);
+
+          await client.query(`
+            INSERT INTO helpdesk_ticket_events (ticket_id, event_type, actor_name, reason, created_at)
+            VALUES ($1, 'CLOSED', $2, 'Respondido pela equipe escolar', $3)
+          `, [ticketId, replierName, fm.replied_at || new Date()]);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Erro ao migrar family_messages para helpdesk_tickets:', err);
+  }
+}
+
 module.exports = {
   pool,
   initDB,
@@ -1439,6 +1729,8 @@ module.exports = {
   seedSchedules, 
   seedParentAccessAndAgenda, 
   seedEnrollmentsAndBindings,
-  seedEducationalPortalData
+  seedEducationalPortalData,
+  seedHelpdeskServiceTypes,
+  migrateLegacyFamilyMessagesToHelpdesk
 };
 

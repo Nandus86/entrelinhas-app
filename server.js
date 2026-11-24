@@ -3,7 +3,7 @@ const cors = require('cors');
 const path = require('path');
 try { require('dotenv').config(); } catch (e) {}
 
-const { pool, initDB, syncStudentTeacher } = require('./db');
+const { pool, initDB, syncStudentTeacher, migrateLegacyFamilyMessagesToHelpdesk } = require('./db');
 const { seedData } = require('./seedData');
 const { hashPassword, verifyPassword, generateToken, verifyToken } = require('./authUtils');
 
@@ -5134,6 +5134,8 @@ app.post('/api/parent/messages', authenticateToken, requireRole('responsavel'), 
       INSERT INTO family_messages (student_id, parent_user_id, parent_name, recipient_type, teacher_id, body, status)
       VALUES ($1, $2, $3, $4, $5, $6, 'nova') RETURNING id
     `, [studentId, parentUserId, req.user.name, recipient_type, teacherId, body]);
+    // Sincroniza imediatamente com helpdesk_tickets para manter ambas as interfaces espelhadas
+    await migrateLegacyFamilyMessagesToHelpdesk(pool).catch(() => {});
     const full = await pool.query(`${FAMILY_MSG_SELECT} WHERE fm.id = $1`, [inserted.rows[0].id]);
     res.status(201).json({ message: 'Mensagem enviada! A equipe responderá por aqui.', item: full.rows[0] });
   } catch (err) {
@@ -5197,6 +5199,37 @@ app.post('/api/family-messages/:id/reply', authenticateToken, requireRole('admin
           status = 'respondida', read_at = COALESCE(read_at, CURRENT_TIMESTAMP)
       WHERE id = $4
     `, [reply, req.user.id, req.user.name, msg.id]);
+
+    // Sincroniza resposta com o chamado correspondente no Help Desk, se existir
+    const hdRes = await pool.query('SELECT id, status FROM helpdesk_tickets WHERE legacy_family_msg_id = $1', [msg.id]);
+    if (hdRes.rows.length > 0) {
+      const hdTicket = hdRes.rows[0];
+      await pool.query(`
+        INSERT INTO helpdesk_messages (ticket_id, sender_user_id, sender_name, sender_type, sender_role, type, content)
+        VALUES ($1, $2, $3, 'ATTENDANT', $4, 'TEXT', $5)
+      `, [hdTicket.id, req.user.id, req.user.name, req.user.role, reply]);
+      await pool.query(`
+        UPDATE helpdesk_tickets
+        SET status = 'CLOSED',
+            attendant_id = COALESCE(attendant_id, $1),
+            attendant_name = COALESCE(attendant_name, $2),
+            first_response_at = COALESCE(first_response_at, CURRENT_TIMESTAMP),
+            closed_at = CURRENT_TIMESTAMP,
+            resolution_type = 'RESOLVED',
+            resolution_summary = 'Respondido pela agenda do aluno.',
+            last_message = $3,
+            last_message_at = CURRENT_TIMESTAMP,
+            unread_by_parent = unread_by_parent + 1,
+            unread_by_staff = 0,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $4
+      `, [req.user.id, req.user.name, reply, hdTicket.id]);
+      await pool.query(`
+        INSERT INTO helpdesk_ticket_events (ticket_id, event_type, actor_name, reason)
+        VALUES ($1, 'CLOSED', $2, 'Respondido pela equipe escolar')
+      `, [hdTicket.id, req.user.name]);
+    }
+
     const full = await pool.query(`${FAMILY_MSG_SELECT} WHERE fm.id = $1`, [msg.id]);
     res.json({ message: 'Resposta enviada para a família.', item: full.rows[0] });
   } catch (err) {
@@ -5204,32 +5237,942 @@ app.post('/api/family-messages/:id/reply', authenticateToken, requireRole('admin
   }
 });
 
-// Mensagens da família que ainda aguardam resposta, para o painel de quem precisa responder.
+// Mensagens/chamados da família que ainda aguardam resposta, para o painel de quem precisa responder.
 // Admin (coordenação): todas as pendentes (para a coordenação e para qualquer professor).
-// Professor: só as endereçadas a ele.
+// Professor: só as endereçadas a ele ou atribuídas a ele.
 app.get('/api/family-messages/pending', authenticateToken, requireRole('admin', 'professor'), async (req, res) => {
   try {
     const params = [];
     let filter = '';
     if (req.user.role === 'professor') {
       params.push(req.user.id);
-      filter = `AND fm.recipient_type = 'professor' AND fm.teacher_id = $1`;
+      filter = `AND (ht.teacher_id = $1 OR ht.attendant_id = $1)`;
     }
     const r = await pool.query(`
-      SELECT fm.id, fm.student_id, fm.recipient_type, fm.teacher_id, fm.status, fm.body,
+      SELECT
+        ht.id,
+        ht.id AS ticket_id,
+        ht.number AS protocol,
+        ht.student_id,
+        ht.recipient_type,
+        ht.teacher_id,
+        CASE WHEN ht.unread_by_staff > 0 THEN 'nova' ELSE 'lida' END AS status,
+        COALESCE(ht.last_message, ht.subject) AS body,
+        ht.subject,
+        ht.service_type_name,
         st.name AS student_name,
         t.name AS teacher_name,
-        to_char(fm.created_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY - HH24"h"MI"m"') AS created_at_br
-      FROM family_messages fm
-      JOIN students st ON st.id = fm.student_id AND st.status = 'ativo'
-      LEFT JOIN users t ON t.id = fm.teacher_id
-      WHERE fm.status <> 'respondida' ${filter}
-      ORDER BY fm.created_at ASC
+        to_char(ht.created_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY - HH24"h"MI"m"') AS created_at_br
+      FROM helpdesk_tickets ht
+      JOIN students st ON st.id = ht.student_id AND st.status = 'ativo'
+      LEFT JOIN users t ON t.id = ht.teacher_id
+      WHERE ht.ticket_scope = 'familia'
+        AND ht.status IN ('WAITING', 'TRANSFERRED')
+        ${filter}
+      ORDER BY ht.created_at ASC
       LIMIT 50
     `, params);
     res.json(r.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ========================================================
+// 🎧 CENTRAL HELP DESK & CONVERSAS (ESCOLA ↔ PAIS + INTERNO)
+// ========================================================
+
+const helpdeskSseClients = new Set();
+
+function broadcastHelpdeskEvent(eventType, payload = {}) {
+  const data = `data: ${JSON.stringify({ type: eventType, ...payload })}\n\n`;
+  for (const client of helpdeskSseClients) {
+    try {
+      client.res.write(data);
+    } catch (e) {
+      helpdeskSseClients.delete(client);
+    }
+  }
+}
+
+// 0. Stream SSE em tempo real para o Help Desk & Conversas
+app.get('/api/helpdesk/stream', async (req, res) => {
+  try {
+    let token = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.split(' ')[1];
+    } else if (req.query && req.query.token) {
+      token = String(req.query.token);
+    }
+
+    const decoded = token ? verifyToken(token) : null;
+    if (!decoded) {
+      return res.status(401).json({ error: 'Sessão expirada ou inválida.' });
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+    res.write(': connected\n\n');
+
+    const clientObj = { res, user: decoded };
+    helpdeskSseClients.add(clientObj);
+
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(': heartbeat\n\n');
+      } catch (e) {
+        clearInterval(heartbeat);
+        helpdeskSseClients.delete(clientObj);
+      }
+    }, 25000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      helpdeskSseClients.delete(clientObj);
+    });
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+});
+
+const HELPDESK_TICKET_SELECT = `
+  SELECT
+    ht.*,
+    st.name AS student_name,
+    st.objective_grade AS student_grade,
+    st.parent_name AS student_parent_name,
+    st.parent_phone AS student_parent_phone,
+    t.name AS teacher_name,
+    hst.code AS service_type_code,
+    hst.sla_minutes AS service_type_sla_minutes,
+    hst.target_role AS service_type_target_role,
+    to_char(ht.created_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY - HH24"h"MI"m"') AS created_at_br,
+    to_char(ht.last_message_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY - HH24"h"MI"m"') AS last_message_at_br,
+    to_char(ht.sla_due_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY - HH24"h"MI"m"') AS sla_due_at_br,
+    to_char(ht.closed_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY - HH24"h"MI"m"') AS closed_at_br,
+    (ht.status <> 'CLOSED' AND ht.sla_due_at IS NOT NULL AND ht.sla_due_at < CURRENT_TIMESTAMP) AS sla_overdue
+  FROM helpdesk_tickets ht
+  LEFT JOIN students st ON st.id = ht.student_id
+  LEFT JOIN users t ON t.id = ht.teacher_id
+  LEFT JOIN helpdesk_service_types hst ON hst.id = ht.service_type_id
+`;
+
+function buildHelpdeskRoleWhere(user, params) {
+  if (user.role === 'responsavel') {
+    params.push(user.student_id);
+    return `ht.ticket_scope = 'familia' AND ht.student_id = $${params.length}`;
+  }
+  if (user.role === 'professor') {
+    params.push(user.id);
+    const idx = params.length;
+    return `(ht.teacher_id = $${idx} OR ht.attendant_id = $${idx} OR ht.requester_user_id = $${idx})`;
+  }
+  return '1=1';
+}
+
+async function loadHelpdeskTicketAuthorized(req, res, ticketId) {
+  const r = await pool.query(`${HELPDESK_TICKET_SELECT} WHERE ht.id = $1`, [ticketId]);
+  if (r.rows.length === 0) {
+    res.status(404).json({ error: 'Chamado ou conversa não encontrado.' });
+    return null;
+  }
+  const ticket = r.rows[0];
+  if (req.user.role === 'responsavel') {
+    if (ticket.ticket_scope !== 'familia' || String(ticket.student_id) !== String(req.user.student_id)) {
+      res.status(403).json({ error: 'Acesso negado a esta conversa.' });
+      return null;
+    }
+  } else if (req.user.role === 'professor') {
+    const isRelated = ticket.teacher_id === req.user.id ||
+                      ticket.attendant_id === req.user.id ||
+                      ticket.requester_user_id === req.user.id ||
+                      (ticket.student_id && await teacherCanAccessStudent(req.user.id, ticket.student_id));
+    if (!isRelated) {
+      res.status(403).json({ error: 'Acesso negado: este chamado não está vinculado a você.' });
+      return null;
+    }
+  }
+  return ticket;
+}
+
+// 1. Listar filas de atendimento (Service Types)
+app.get('/api/helpdesk/service-types', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role === 'responsavel') {
+      const r = await pool.query(`
+        SELECT * FROM helpdesk_service_types
+        WHERE restricted_to_staff = false AND active = true
+        ORDER BY code ASC, id ASC
+      `);
+      return res.json(r.rows);
+    }
+    const r = await pool.query(`
+      SELECT hst.*,
+        (SELECT COUNT(*) FROM helpdesk_tickets ht WHERE ht.service_type_id = hst.id AND ht.status <> 'CLOSED')::int AS open_tickets_count
+      FROM helpdesk_service_types hst
+      ORDER BY hst.code ASC, hst.id ASC
+    `);
+    res.json(r.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao listar filas de atendimento: ' + err.message });
+  }
+});
+
+// 2. Criar nova fila de atendimento (Admin)
+app.post('/api/helpdesk/service-types', authenticateToken, requireRole('admin'), async (req, res) => {
+  try {
+    const {
+      code,
+      name,
+      description,
+      urgency = 3,
+      sla_minutes = 120,
+      welcome_message,
+      target_role = 'coordenacao',
+      restricted_to_staff = false,
+      active = true
+    } = req.body;
+
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: 'O nome da fila de atendimento é obrigatório.' });
+    }
+
+    let finalCode = code ? String(code).trim() : '';
+    if (!finalCode) {
+      const maxRes = await pool.query('SELECT COUNT(*) FROM helpdesk_service_types');
+      finalCode = String(parseInt(maxRes.rows[0].count) + 1).padStart(3, '0');
+    }
+
+    const urg = Math.min(5, Math.max(1, parseInt(urgency) || 3));
+    const sla = Math.max(5, parseInt(sla_minutes) || 120);
+
+    const r = await pool.query(`
+      INSERT INTO helpdesk_service_types
+        (code, name, description, urgency, sla_minutes, welcome_message, target_role, restricted_to_staff, active)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *
+    `, [
+      finalCode,
+      String(name).trim(),
+      description ? String(description).trim() : null,
+      urg,
+      sla,
+      welcome_message ? String(welcome_message).trim() : null,
+      target_role || 'coordenacao',
+      Boolean(restricted_to_staff),
+      active !== undefined ? Boolean(active) : true
+    ]);
+
+    res.status(201).json({ message: 'Fila de atendimento criada com sucesso!', item: r.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(400).json({ error: 'Já existe uma fila com este código.' });
+    }
+    res.status(500).json({ error: 'Erro ao criar fila: ' + err.message });
+  }
+});
+
+// 3. Atualizar fila de atendimento (Admin)
+app.put('/api/helpdesk/service-types/:id', authenticateToken, requireRole('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      code,
+      name,
+      description,
+      urgency,
+      sla_minutes,
+      welcome_message,
+      target_role,
+      restricted_to_staff,
+      active
+    } = req.body;
+
+    const r = await pool.query(`
+      UPDATE helpdesk_service_types
+      SET code = COALESCE($1, code),
+          name = COALESCE($2, name),
+          description = CASE WHEN $3::text IS NOT NULL THEN $3 ELSE description END,
+          urgency = COALESCE($4, urgency),
+          sla_minutes = COALESCE($5, sla_minutes),
+          welcome_message = CASE WHEN $6::text IS NOT NULL THEN $6 ELSE welcome_message END,
+          target_role = COALESCE($7, target_role),
+          restricted_to_staff = COALESCE($8, restricted_to_staff),
+          active = COALESCE($9, active)
+      WHERE id = $10
+      RETURNING *
+    `, [
+      code ? String(code).trim() : null,
+      name ? String(name).trim() : null,
+      description !== undefined ? (description ? String(description).trim() : '') : null,
+      urgency !== undefined ? Math.min(5, Math.max(1, parseInt(urgency) || 3)) : null,
+      sla_minutes !== undefined ? Math.max(5, parseInt(sla_minutes) || 120) : null,
+      welcome_message !== undefined ? (welcome_message ? String(welcome_message).trim() : '') : null,
+      target_role || null,
+      restricted_to_staff !== undefined ? Boolean(restricted_to_staff) : null,
+      active !== undefined ? Boolean(active) : null,
+      id
+    ]);
+
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Fila não encontrada.' });
+    res.json({ message: 'Fila atualizada com sucesso!', item: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao atualizar fila: ' + err.message });
+  }
+});
+
+// 4. Excluir fila de atendimento (Admin)
+app.delete('/api/helpdesk/service-types/:id', authenticateToken, requireRole('admin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const r = await pool.query('DELETE FROM helpdesk_service_types WHERE id = $1 RETURNING id', [id]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Fila não encontrada.' });
+    res.json({ message: 'Fila removida com sucesso!' });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao remover fila: ' + err.message });
+  }
+});
+
+// 5. KPIs e contadores do Help Desk (escopado por perfil)
+app.get('/api/helpdesk/stats', authenticateToken, async (req, res) => {
+  try {
+    const params = [];
+    const roleWhere = buildHelpdeskRoleWhere(req.user, params);
+    const unreadCol = req.user.role === 'responsavel' ? 'ht.unread_by_parent' : 'ht.unread_by_staff';
+
+    const r = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE ht.status = 'WAITING')::int AS waiting,
+        COUNT(*) FILTER (WHERE ht.status = 'IN_PROGRESS')::int AS in_progress,
+        COUNT(*) FILTER (WHERE ht.status = 'TRANSFERRED')::int AS transferred,
+        COUNT(*) FILTER (WHERE ht.status = 'CLOSED')::int AS closed,
+        COUNT(*) FILTER (WHERE ht.status <> 'CLOSED' AND ht.sla_due_at IS NOT NULL AND ht.sla_due_at < CURRENT_TIMESTAMP)::int AS sla_overdue,
+        COALESCE(SUM(CASE WHEN ${unreadCol} > 0 THEN 1 ELSE 0 END), 0)::int AS unread
+      FROM helpdesk_tickets ht
+      WHERE ${roleWhere}
+    `, params);
+
+    res.json(r.rows[0] || { waiting: 0, in_progress: 0, transferred: 0, closed: 0, sla_overdue: 0, unread: 0 });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao carregar estatísticas do Help Desk: ' + err.message });
+  }
+});
+
+// 6. Listar chamados / conversas com filtros
+app.get('/api/helpdesk/tickets', authenticateToken, async (req, res) => {
+  try {
+    const { status, service_type_id, urgency, scope, student_id, search } = req.query;
+    const params = [];
+    const conditions = [buildHelpdeskRoleWhere(req.user, params)];
+
+    if (status && status !== 'todos' && status !== 'ALL') {
+      params.push(String(status).toUpperCase());
+      conditions.push(`ht.status = $${params.length}`);
+    }
+    if (service_type_id) {
+      params.push(parseInt(service_type_id));
+      conditions.push(`ht.service_type_id = $${params.length}`);
+    }
+    if (urgency) {
+      params.push(parseInt(urgency));
+      conditions.push(`ht.urgency = $${params.length}`);
+    }
+    if (scope && ['familia', 'interno'].includes(scope) && req.user.role !== 'responsavel') {
+      params.push(scope);
+      conditions.push(`ht.ticket_scope = $${params.length}`);
+    }
+    if (student_id && req.user.role !== 'responsavel') {
+      params.push(parseInt(student_id));
+      conditions.push(`ht.student_id = $${params.length}`);
+    }
+    if (search && String(search).trim()) {
+      params.push(`%${String(search).trim()}%`);
+      const idx = params.length;
+      conditions.push(`(
+        ht.number ILIKE $${idx}
+        OR ht.subject ILIKE $${idx}
+        OR ht.requester_name ILIKE $${idx}
+        OR ht.last_message ILIKE $${idx}
+        OR st.name ILIKE $${idx}
+      )`);
+    }
+
+    const query = `
+      ${HELPDESK_TICKET_SELECT}
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY
+        CASE WHEN ht.status = 'CLOSED' THEN 1 ELSE 0 END ASC,
+        ht.last_message_at DESC,
+        ht.id DESC
+      LIMIT 200
+    `;
+
+    const r = await pool.query(query, params);
+    res.json(r.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao listar chamados: ' + err.message });
+  }
+});
+
+// 7. Obter detalhes completos de um chamado (ticket + messages + notes + events) e zerar não lidos
+app.get('/api/helpdesk/tickets/:id', authenticateToken, async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id);
+    if (!ticketId) return res.status(400).json({ error: 'ID inválido.' });
+
+    const ticket = await loadHelpdeskTicketAuthorized(req, res, ticketId);
+    if (!ticket) return;
+
+    // Zera contador de não lidos do papel que abriu a conversa
+    if (req.user.role === 'responsavel') {
+      if (ticket.unread_by_parent > 0) {
+        await pool.query('UPDATE helpdesk_tickets SET unread_by_parent = 0 WHERE id = $1', [ticketId]);
+        ticket.unread_by_parent = 0;
+      }
+    } else {
+      if (ticket.unread_by_staff > 0) {
+        await pool.query('UPDATE helpdesk_tickets SET unread_by_staff = 0 WHERE id = $1', [ticketId]);
+        ticket.unread_by_staff = 0;
+      }
+      // Se houver family_message legado com status 'nova', marca como 'lida'
+      if (ticket.legacy_family_msg_id) {
+        await pool.query(
+          "UPDATE family_messages SET status = CASE WHEN status = 'nova' THEN 'lida' ELSE status END, read_at = COALESCE(read_at, CURRENT_TIMESTAMP) WHERE id = $1",
+          [ticket.legacy_family_msg_id]
+        ).catch(() => {});
+      }
+    }
+
+    const messagesRes = await pool.query(`
+      SELECT hm.*,
+        to_char(hm.created_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY - HH24"h"MI"m"') AS created_at_br
+      FROM helpdesk_messages hm
+      WHERE hm.ticket_id = $1
+      ORDER BY hm.created_at ASC, hm.id ASC
+    `, [ticketId]);
+
+    let notes = [];
+    if (req.user.role !== 'responsavel') {
+      const notesRes = await pool.query(`
+        SELECT hn.*,
+          to_char(hn.created_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY - HH24"h"MI"m"') AS created_at_br
+        FROM helpdesk_ticket_notes hn
+        WHERE hn.ticket_id = $1
+        ORDER BY hn.created_at ASC, hn.id ASC
+      `, [ticketId]);
+      notes = notesRes.rows;
+    }
+
+    const eventsRes = await pool.query(`
+      SELECT he.*,
+        to_char(he.created_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY - HH24"h"MI"m"') AS created_at_br
+      FROM helpdesk_ticket_events he
+      WHERE he.ticket_id = $1
+      ORDER BY he.created_at ASC, he.id ASC
+    `, [ticketId]);
+
+    res.json({
+      ticket,
+      messages: messagesRes.rows,
+      notes,
+      events: eventsRes.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao carregar detalhes do chamado: ' + err.message });
+  }
+});
+
+// 8. Abrir novo chamado / conversa
+app.post('/api/helpdesk/tickets', authenticateToken, async (req, res) => {
+  try {
+    const {
+      ticket_scope,
+      student_id,
+      service_type_id,
+      recipient_type,
+      teacher_id,
+      subject,
+      body,
+      content,
+      urgency
+    } = req.body;
+
+    const msgBody = String(body || content || '').trim();
+    if (msgBody.length < 2) {
+      return res.status(400).json({ error: 'Escreva a mensagem inicial antes de abrir o chamado.' });
+    }
+
+    const isParent = req.user.role === 'responsavel';
+    const finalScope = isParent ? 'familia' : (ticket_scope === 'interno' ? 'interno' : 'familia');
+
+    let finalStudentId = isParent ? req.user.student_id : (student_id ? parseInt(student_id) : null);
+    if (finalScope === 'familia' && !finalStudentId) {
+      return res.status(400).json({ error: 'Selecione o aluno vinculado a esta conversa.' });
+    }
+
+    // Busca a fila selecionada ou padrão
+    let sType = null;
+    if (service_type_id) {
+      const stRes = await pool.query('SELECT * FROM helpdesk_service_types WHERE id = $1', [parseInt(service_type_id)]);
+      sType = stRes.rows[0] || null;
+    }
+    if (!sType) {
+      const fallbackCode = finalScope === 'interno' ? '006' : (recipient_type === 'professor' ? '001' : '002');
+      const stRes = await pool.query('SELECT * FROM helpdesk_service_types WHERE code = $1 LIMIT 1', [fallbackCode]);
+      sType = stRes.rows[0] || null;
+    }
+
+    if (isParent && sType && sType.restricted_to_staff) {
+      return res.status(403).json({ error: 'Esta fila é exclusiva para chamados internos da equipe.' });
+    }
+
+    const finalRecipientType = recipient_type || (sType ? sType.target_role : 'coordenacao');
+    let finalTeacherId = teacher_id ? parseInt(teacher_id) : null;
+    if (!finalTeacherId && finalRecipientType === 'professor' && finalStudentId) {
+      const stTeach = await pool.query('SELECT assigned_teacher_id FROM students WHERE id = $1', [finalStudentId]);
+      if (stTeach.rows[0] && stTeach.rows[0].assigned_teacher_id) {
+        finalTeacherId = stTeach.rows[0].assigned_teacher_id;
+      }
+    }
+    if (req.user.role === 'professor' && finalScope === 'familia' && !finalTeacherId) {
+      finalTeacherId = req.user.id;
+    }
+
+    const finalUrgency = urgency
+      ? Math.min(5, Math.max(1, parseInt(urgency)))
+      : (sType ? sType.urgency : 3);
+    const slaMinutes = sType ? (parseInt(sType.sla_minutes) || 120) : 120;
+
+    const finalSubject = (subject && String(subject).trim())
+      ? String(subject).trim().slice(0, 200)
+      : (msgBody.length > 65 ? msgBody.slice(0, 62) + '...' : msgBody);
+
+    const requesterUserId = (req.user.id && req.user.id < 10000) ? req.user.id : null;
+    const requesterName = req.user.name || (isParent ? 'Família' : 'Equipe');
+    const codePrefix = sType && sType.code ? sType.code : (finalScope === 'interno' ? '006' : '002');
+    const tempNumber = `EN${codePrefix}-TMP-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+    // Se quem abre é staff para a família, já entra em IN_PROGRESS e notifica os pais
+    const openedByStaffToFamily = !isParent && finalScope === 'familia';
+    const initialStatus = openedByStaffToFamily ? 'IN_PROGRESS' : 'WAITING';
+    const unreadParent = openedByStaffToFamily ? 1 : 0;
+    const unreadStaff = openedByStaffToFamily ? 0 : 1;
+    const attendantId = openedByStaffToFamily ? req.user.id : null;
+    const attendantName = openedByStaffToFamily ? req.user.name : null;
+
+    // Se família abriu conversa, cria também em family_messages para retrocompatibilidade
+    let legacyId = null;
+    if (isParent && finalStudentId) {
+      const fmRecipient = finalRecipientType === 'professor' ? 'professor' : 'coordenacao';
+      const fmIns = await pool.query(`
+        INSERT INTO family_messages (student_id, parent_user_id, parent_name, recipient_type, teacher_id, body, status)
+        VALUES ($1, $2, $3, $4, $5, $6, 'nova')
+        RETURNING id
+      `, [finalStudentId, requesterUserId, requesterName, fmRecipient, finalTeacherId, msgBody]);
+      legacyId = fmIns.rows[0].id;
+    }
+
+    const ins = await pool.query(`
+      INSERT INTO helpdesk_tickets (
+        number, ticket_scope, student_id, service_type_id, service_type_name,
+        recipient_type, teacher_id, attendant_id, attendant_name,
+        requester_role, requester_user_id, requester_name,
+        subject, urgency, status, unread_by_parent, unread_by_staff,
+        last_message, last_message_at, sla_due_at, first_response_at, legacy_family_msg_id
+      ) VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, $9,
+        $10, $11, $12,
+        $13, $14, $15, $16, $17,
+        $18, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + ($19 || ' minutes')::interval, $20, $21
+      ) RETURNING id
+    `, [
+      tempNumber,
+      finalScope,
+      finalStudentId,
+      sType ? sType.id : null,
+      sType ? sType.name : 'Atendimento Escolar',
+      finalRecipientType,
+      finalTeacherId,
+      attendantId,
+      attendantName,
+      req.user.role,
+      requesterUserId,
+      requesterName,
+      finalSubject,
+      finalUrgency,
+      initialStatus,
+      unreadParent,
+      unreadStaff,
+      msgBody,
+      String(slaMinutes),
+      openedByStaffToFamily ? new Date() : null,
+      legacyId
+    ]);
+
+    const ticketId = ins.rows[0].id;
+    const finalNumber = `EN${codePrefix}-${String(ticketId).padStart(5, '0')}`;
+    await pool.query('UPDATE helpdesk_tickets SET number = $1 WHERE id = $2', [finalNumber, ticketId]);
+
+    // 1ª mensagem
+    const firstSenderType = openedByStaffToFamily ? 'ATTENDANT' : 'CUSTOMER';
+    await pool.query(`
+      INSERT INTO helpdesk_messages (ticket_id, sender_user_id, sender_name, sender_type, sender_role, type, content)
+      VALUES ($1, $2, $3, $4, $5, 'TEXT', $6)
+    `, [ticketId, requesterUserId, requesterName, firstSenderType, req.user.role, msgBody]);
+
+    // Mensagem automática de boas-vindas (BOT) quando aberto por solicitante em status WAITING
+    if (!openedByStaffToFamily && sType && sType.welcome_message) {
+      await pool.query(`
+        INSERT INTO helpdesk_messages (ticket_id, sender_user_id, sender_name, sender_type, sender_role, type, content)
+        VALUES ($1, NULL, 'Assistente Entrelinhas', 'BOT', 'system', 'TEXT', $2)
+      `, [ticketId, sType.welcome_message]);
+    }
+
+    // Evento CREATED
+    await pool.query(`
+      INSERT INTO helpdesk_ticket_events (ticket_id, event_type, actor_name, destination_name, reason)
+      VALUES ($1, 'CREATED', $2, $3, $4)
+    `, [ticketId, requesterName, sType ? sType.name : 'Atendimento', finalSubject]);
+
+    const full = await pool.query(`${HELPDESK_TICKET_SELECT} WHERE ht.id = $1`, [ticketId]);
+    broadcastHelpdeskEvent('ticket_created', { ticketId, studentId: finalStudentId });
+    res.status(201).json({
+      message: `Chamado ${finalNumber} aberto com sucesso!`,
+      ticket: full.rows[0]
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao abrir chamado: ' + err.message });
+  }
+});
+
+// 9. Enviar mensagem em um chamado existente
+app.post('/api/helpdesk/tickets/:id/messages', authenticateToken, async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id);
+    const ticket = await loadHelpdeskTicketAuthorized(req, res, ticketId);
+    if (!ticket) return;
+
+    const content = String(req.body.content || req.body.body || '').trim();
+    if (!content) {
+      return res.status(400).json({ error: 'Digite a mensagem antes de enviar.' });
+    }
+
+    const isParent = req.user.role === 'responsavel';
+    const isRequesterOnInternal = ticket.ticket_scope === 'interno' && ticket.requester_user_id === req.user.id && req.user.role !== 'admin';
+    const isCustomerSide = isParent || isRequesterOnInternal;
+    const senderType = isCustomerSide ? 'CUSTOMER' : 'ATTENDANT';
+    const senderUserId = (req.user.id && req.user.id < 10000) ? req.user.id : null;
+
+    const msgIns = await pool.query(`
+      INSERT INTO helpdesk_messages (ticket_id, sender_user_id, sender_name, sender_type, sender_role, type, content)
+      VALUES ($1, $2, $3, $4, $5, 'TEXT', $6)
+      RETURNING *, to_char(created_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY - HH24"h"MI"m"') AS created_at_br
+    `, [ticketId, senderUserId, req.user.name, senderType, req.user.role, content]);
+
+    let newStatus = ticket.status;
+    let newAttendantId = ticket.attendant_id;
+    let newAttendantName = ticket.attendant_name;
+
+    if (!isCustomerSide) {
+      // Equipe respondeu: se estava WAITING ou TRANSFERRED, assume automaticamente para IN_PROGRESS
+      if (ticket.status === 'WAITING' || ticket.status === 'TRANSFERRED') {
+        newStatus = 'IN_PROGRESS';
+        newAttendantId = req.user.id;
+        newAttendantName = req.user.name;
+        await pool.query(`
+          INSERT INTO helpdesk_ticket_events (ticket_id, event_type, actor_name, destination_name)
+          VALUES ($1, 'CLAIM', $2::varchar, $2::varchar)
+        `, [ticketId, req.user.name]);
+      }
+      await pool.query(`
+        UPDATE helpdesk_tickets
+        SET status = $1,
+            attendant_id = COALESCE($2, attendant_id),
+            attendant_name = COALESCE($3, attendant_name),
+            first_response_at = COALESCE(first_response_at, CURRENT_TIMESTAMP),
+            last_message = $4,
+            last_message_at = CURRENT_TIMESTAMP,
+            unread_by_parent = unread_by_parent + 1,
+            unread_by_staff = 0,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $5
+      `, [newStatus, newAttendantId, newAttendantName, content, ticketId]);
+
+      // Atualiza também family_messages se for vinculado
+      if (ticket.legacy_family_msg_id) {
+        await pool.query(`
+          UPDATE family_messages
+          SET reply = $1, reply_by = $2, reply_by_name = $3, replied_at = CURRENT_TIMESTAMP,
+              status = 'respondida', read_at = COALESCE(read_at, CURRENT_TIMESTAMP)
+          WHERE id = $4
+        `, [content, req.user.id, req.user.name, ticket.legacy_family_msg_id]).catch(() => {});
+      }
+    } else {
+      // Família / solicitante respondeu: se estava CLOSED, reabre automaticamente
+      if (ticket.status === 'CLOSED') {
+        newStatus = ticket.attendant_id ? 'IN_PROGRESS' : 'WAITING';
+        await pool.query(`
+          INSERT INTO helpdesk_ticket_events (ticket_id, event_type, actor_name, reason)
+          VALUES ($1, 'REOPENED', $2, 'Nova mensagem enviada pelo solicitante')
+        `, [ticketId, req.user.name]);
+      }
+      await pool.query(`
+        UPDATE helpdesk_tickets
+        SET status = $1::varchar,
+            closed_at = CASE WHEN $1::varchar <> 'CLOSED' THEN NULL ELSE closed_at END,
+            last_message = $2,
+            last_message_at = CURRENT_TIMESTAMP,
+            unread_by_staff = unread_by_staff + 1,
+            unread_by_parent = 0,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $3
+      `, [newStatus, content, ticketId]);
+    }
+
+    const updatedTicket = await pool.query(`${HELPDESK_TICKET_SELECT} WHERE ht.id = $1`, [ticketId]);
+    broadcastHelpdeskEvent('message_created', { ticketId, studentId: ticket.student_id, message: msgIns.rows[0] });
+    res.status(201).json({
+      message: 'Mensagem enviada!',
+      item: msgIns.rows[0],
+      ticket: updatedTicket.rows[0]
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao enviar mensagem: ' + err.message });
+  }
+});
+
+// 10. Assumir atendimento (Claim)
+app.post('/api/helpdesk/tickets/:id/claim', authenticateToken, requireRole('admin', 'professor'), async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id);
+    const ticket = await loadHelpdeskTicketAuthorized(req, res, ticketId);
+    if (!ticket) return;
+
+    await pool.query(`
+      UPDATE helpdesk_tickets
+      SET status = 'IN_PROGRESS',
+          attendant_id = $1,
+          attendant_name = $2,
+          first_response_at = COALESCE(first_response_at, CURRENT_TIMESTAMP),
+          unread_by_staff = 0,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $3
+    `, [req.user.id, req.user.name, ticketId]);
+
+    const sysMsg = `Atendimento assumido por ${req.user.name}.`;
+    await pool.query(`
+      INSERT INTO helpdesk_messages (ticket_id, sender_user_id, sender_name, sender_type, sender_role, type, content)
+      VALUES ($1, $2, $3, 'SYSTEM', $4, 'TEXT', $5)
+    `, [ticketId, req.user.id, req.user.name, req.user.role, sysMsg]);
+
+    await pool.query(`
+      INSERT INTO helpdesk_ticket_events (ticket_id, event_type, actor_name, origin_name, destination_name)
+      VALUES ($1, 'CLAIM', $2::varchar, $3::varchar, $2::varchar)
+    `, [ticketId, req.user.name, ticket.attendant_name || 'Fila de Espera']);
+
+    const updated = await pool.query(`${HELPDESK_TICKET_SELECT} WHERE ht.id = $1`, [ticketId]);
+    broadcastHelpdeskEvent('ticket_updated', { ticketId, studentId: ticket.student_id });
+    res.json({ message: 'Você assumiu este chamado!', ticket: updated.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao assumir chamado: ' + err.message });
+  }
+});
+
+// 11. Transferir chamado para outra fila ou professor/atendente
+app.post('/api/helpdesk/tickets/:id/transfer', authenticateToken, requireRole('admin', 'professor'), async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id);
+    const ticket = await loadHelpdeskTicketAuthorized(req, res, ticketId);
+    if (!ticket) return;
+
+    const { service_type_id, teacher_id, attendant_id, reason } = req.body;
+    let newServiceTypeId = ticket.service_type_id;
+    let newServiceTypeName = ticket.service_type_name;
+    let newRecipientType = ticket.recipient_type;
+
+    if (service_type_id) {
+      const stRes = await pool.query('SELECT * FROM helpdesk_service_types WHERE id = $1', [parseInt(service_type_id)]);
+      if (stRes.rows[0]) {
+        newServiceTypeId = stRes.rows[0].id;
+        newServiceTypeName = stRes.rows[0].name;
+        newRecipientType = stRes.rows[0].target_role || newRecipientType;
+      }
+    }
+
+    const targetUserId = attendant_id ? parseInt(attendant_id) : (teacher_id ? parseInt(teacher_id) : null);
+    let targetUserName = null;
+    let newTeacherId = ticket.teacher_id;
+    if (targetUserId) {
+      const uRes = await pool.query('SELECT id, name, role FROM users WHERE id = $1', [targetUserId]);
+      if (uRes.rows[0]) {
+        targetUserName = uRes.rows[0].name;
+        if (uRes.rows[0].role === 'professor') {
+          newTeacherId = uRes.rows[0].id;
+          newRecipientType = 'professor';
+        }
+      }
+    }
+
+    const originDesc = ticket.attendant_name || ticket.service_type_name || 'Fila Anterior';
+    const destDesc = [newServiceTypeName, targetUserName].filter(Boolean).join(' • ') || 'Nova Fila';
+    const cleanReason = reason ? String(reason).trim() : 'Encaminhamento interno';
+
+    await pool.query(`
+      UPDATE helpdesk_tickets
+      SET status = 'TRANSFERRED',
+          service_type_id = $1,
+          service_type_name = $2,
+          recipient_type = $3,
+          teacher_id = $4,
+          attendant_id = $5,
+          attendant_name = $6,
+          transfer_count = transfer_count + 1,
+          unread_by_staff = 1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $7
+    `, [newServiceTypeId, newServiceTypeName, newRecipientType, newTeacherId, targetUserId, targetUserName, ticketId]);
+
+    const sysMsg = `Chamado transferido por ${req.user.name} para ${destDesc}. Motivo: ${cleanReason}`;
+    await pool.query(`
+      INSERT INTO helpdesk_messages (ticket_id, sender_user_id, sender_name, sender_type, sender_role, type, content)
+      VALUES ($1, $2, $3, 'SYSTEM', $4, 'TEXT', $5)
+    `, [ticketId, req.user.id, req.user.name, req.user.role, sysMsg]);
+
+    await pool.query(`
+      INSERT INTO helpdesk_ticket_events (ticket_id, event_type, actor_name, origin_name, destination_name, reason)
+      VALUES ($1, 'TRANSFERRED', $2, $3, $4, $5)
+    `, [ticketId, req.user.name, originDesc, destDesc, cleanReason]);
+
+    const updated = await pool.query(`${HELPDESK_TICKET_SELECT} WHERE ht.id = $1`, [ticketId]);
+    broadcastHelpdeskEvent('ticket_updated', { ticketId, studentId: ticket.student_id });
+    res.json({ message: 'Chamado transferido com sucesso!', ticket: updated.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao transferir chamado: ' + err.message });
+  }
+});
+
+// 12. Encerrar chamado (Close)
+app.post('/api/helpdesk/tickets/:id/close', authenticateToken, async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id);
+    const ticket = await loadHelpdeskTicketAuthorized(req, res, ticketId);
+    if (!ticket) return;
+
+    const { resolution_type = 'RESOLVED', resolution_summary = '' } = req.body;
+    const finalResType = resolution_type === 'NOT_RESOLVED' ? 'NOT_RESOLVED' : 'RESOLVED';
+    const summary = String(resolution_summary || '').trim() || 'Atendimento concluído.';
+
+    await pool.query(`
+      UPDATE helpdesk_tickets
+      SET status = 'CLOSED',
+          closed_at = CURRENT_TIMESTAMP,
+          resolution_type = $1,
+          resolution_summary = $2,
+          attendant_id = COALESCE(attendant_id, $3),
+          attendant_name = COALESCE(attendant_name, $4),
+          unread_by_staff = 0,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $5
+    `, [finalResType, summary, req.user.role !== 'responsavel' ? req.user.id : null, req.user.role !== 'responsavel' ? req.user.name : null, ticketId]);
+
+    if (ticket.legacy_family_msg_id) {
+      await pool.query(
+        "UPDATE family_messages SET status = 'respondida', replied_at = COALESCE(replied_at, CURRENT_TIMESTAMP), reply = COALESCE(reply, $1) WHERE id = $2",
+        [summary, ticket.legacy_family_msg_id]
+      ).catch(() => {});
+    }
+
+    const labelRes = finalResType === 'RESOLVED' ? 'Resolvido' : 'Encerrado sem resolução';
+    const sysMsg = `Chamado encerrado por ${req.user.name} (${labelRes}): ${summary}`;
+    await pool.query(`
+      INSERT INTO helpdesk_messages (ticket_id, sender_user_id, sender_name, sender_type, sender_role, type, content)
+      VALUES ($1, $2, $3, 'SYSTEM', $4, 'TEXT', $5)
+    `, [ticketId, (req.user.id && req.user.id < 10000) ? req.user.id : null, req.user.name, req.user.role, sysMsg]);
+
+    await pool.query(`
+      INSERT INTO helpdesk_ticket_events (ticket_id, event_type, actor_name, destination_name, reason)
+      VALUES ($1, 'CLOSED', $2, $3, $4)
+    `, [ticketId, req.user.name, labelRes, summary]);
+
+    const updated = await pool.query(`${HELPDESK_TICKET_SELECT} WHERE ht.id = $1`, [ticketId]);
+    broadcastHelpdeskEvent('ticket_updated', { ticketId, studentId: ticket.student_id });
+    res.json({ message: 'Chamado encerrado com sucesso!', ticket: updated.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao encerrar chamado: ' + err.message });
+  }
+});
+
+// 13. Reabrir chamado (Reopen)
+app.post('/api/helpdesk/tickets/:id/reopen', authenticateToken, async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id);
+    const ticket = await loadHelpdeskTicketAuthorized(req, res, ticketId);
+    if (!ticket) return;
+
+    const newStatus = ticket.attendant_id ? 'IN_PROGRESS' : 'WAITING';
+    await pool.query(`
+      UPDATE helpdesk_tickets
+      SET status = $1,
+          closed_at = NULL,
+          unread_by_staff = CASE WHEN $2::varchar = 'responsavel' THEN 1 ELSE unread_by_staff END,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $3
+    `, [newStatus, req.user.role, ticketId]);
+
+    const sysMsg = `Chamado reaberto por ${req.user.name}.`;
+    await pool.query(`
+      INSERT INTO helpdesk_messages (ticket_id, sender_user_id, sender_name, sender_type, sender_role, type, content)
+      VALUES ($1, $2, $3, 'SYSTEM', $4, 'TEXT', $5)
+    `, [ticketId, (req.user.id && req.user.id < 10000) ? req.user.id : null, req.user.name, req.user.role, sysMsg]);
+
+    await pool.query(`
+      INSERT INTO helpdesk_ticket_events (ticket_id, event_type, actor_name, reason)
+      VALUES ($1, 'REOPENED', $2, $3)
+    `, [ticketId, req.user.name, req.body.reason ? String(req.body.reason).trim() : 'Reaberto manualmente']);
+
+    const updated = await pool.query(`${HELPDESK_TICKET_SELECT} WHERE ht.id = $1`, [ticketId]);
+    broadcastHelpdeskEvent('ticket_updated', { ticketId, studentId: ticket.student_id });
+    res.json({ message: 'Chamado reaberto!', ticket: updated.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao reabrir chamado: ' + err.message });
+  }
+});
+
+// 14. Adicionar Nota Interna da Equipe (invisível para os pais)
+app.post('/api/helpdesk/tickets/:id/notes', authenticateToken, requireRole('admin', 'professor'), async (req, res) => {
+  try {
+    const ticketId = parseInt(req.params.id);
+    const ticket = await loadHelpdeskTicketAuthorized(req, res, ticketId);
+    if (!ticket) return;
+
+    const content = String(req.body.content || '').trim();
+    if (!content) {
+      return res.status(400).json({ error: 'Escreva o conteúdo da nota interna.' });
+    }
+
+    const r = await pool.query(`
+      INSERT INTO helpdesk_ticket_notes (ticket_id, user_id, user_name, content)
+      VALUES ($1, $2, $3, $4)
+      RETURNING *, to_char(created_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY - HH24"h"MI"m"') AS created_at_br
+    `, [ticketId, req.user.id, req.user.name, content]);
+
+    await pool.query(`
+      INSERT INTO helpdesk_ticket_events (ticket_id, event_type, actor_name, reason)
+      VALUES ($1, 'NOTE_ADDED', $2, 'Nota interna registrada pela equipe')
+    `, [ticketId, req.user.name]);
+
+    broadcastHelpdeskEvent('ticket_updated', { ticketId, studentId: ticket.student_id });
+    res.status(201).json({ message: 'Nota interna adicionada!', item: r.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao salvar nota interna: ' + err.message });
   }
 });
 
